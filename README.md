@@ -2,6 +2,9 @@
 🏗️ 🚧 This library is under construction!🚧
 ===========================================
 
+![brain printer](synecdoche.png "Synecdoche")
+
+
 Synecdoche: HyperNetworks in Haiku
 ===================================
 
