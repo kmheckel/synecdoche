@@ -22,8 +22,8 @@ requires = (
 
 # This call to setup() does all the work
 setup(
-    name="spyx",
-    version="0.0.5",
+    name="synecdoche",
+    version="0.0.2",
     description="Synecdoche: Hypernetworks for Haiku in JAX",
     long_description=long_description,
     long_description_content_type="text/markdown",

@@ -1,4 +1,4 @@
-Synechdoche: HyperNetworks in Haiku
+Synecdoche: HyperNetworks in Haiku
 ===================================
 
 Hi!
