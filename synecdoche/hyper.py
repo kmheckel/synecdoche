@@ -6,9 +6,9 @@ import haiku as hk
 
 def param_count(hypernetwork_params):
     """ Count the number of learnable params in a network"""
-    return jnp.sum(tree.tree_map(jnp.size, hypernetwork_params))
+    return sum(tree.tree_leaves(tree.tree_map(jnp.size, hypernetwork_params)))
 
-def hypernetwork_compression_ratio(hypernet_params, target_params):
+def compression_ratio(hypernet_params, target_params):
     """ Compute the savings from using a hypernetwork based approach"""
     return param_count(hypernet_params) / param_count(target_params)
 
@@ -173,18 +173,20 @@ class Hypernetwork(hk.Module):
         # hypernetwork dimensions
         self.embedding_dim = embedding_dim
         self.latent_dim = latent_dim
-        self.hyper_out_dim = tree.tree_reduce(max, self.tgt_sizes)
         
     def __call__(self):
         embeddings = hk.get_parameter("w", [self.num_tgt_layers, self.embedding_dim],
                                       init=hk.initializers.TruncatedNormal())
-        projections = hk.nets.MLP([self.latent_dim, self.hyper_out_dim])(embeddings)
+        projections = hk.nets.MLP([self.latent_dim, self.latent_dim])(embeddings)
         # tgt_layers X max_layer_size matrix
         
         layer_projections = jnp.split(projections, self.num_tgt_layers)
                 
         rebuilt_tree = tree.tree_unflatten(self.tgt_treedef, layer_projections)
-        resized_tree = tree.tree_map(lambda layer, size: layer[1,:size], 
+        # this is ugly... sorry...
+        resized_tree = tree.tree_map(lambda layer, size: jnp.pad(layer[1,:size], 
+                                                                 (0,max(0,size-layer.size)), 
+                                                                 mode="wrap"), 
                                      rebuilt_tree, 
                                      self.tgt_sizes
                                     )
