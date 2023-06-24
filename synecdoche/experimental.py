@@ -6,6 +6,9 @@ import haiku as hk
 class DynamicHypernetwork(hk.Module):
     """
     Hypernetwork that takes the current batch as inputs, averages the samples, and then uses that average to predict weights for the layer.
+
+    This will be modified soon such that it contains a dynamic hypernet for a single input
+    that is then vmapped over the batch axis.
     """
 
     def __init__(self, embedding_dim, latent_dim, network_params):
@@ -29,7 +32,7 @@ class DynamicHypernetwork(hk.Module):
                 
         rebuilt_tree = tree.tree_unflatten(self.tgt_treedef, layer_projections)
         resized_tree = tree.tree_map(lambda layer, size: jnp.pad(layer[1,:size], 
-                                                                 (0,max(0,size-layer.size)), 
+                                                                 (0,jnp.max(0,size-layer.size)), 
                                                                  mode="wrap"), 
                                      rebuilt_tree, 
                                      self.tgt_sizes
