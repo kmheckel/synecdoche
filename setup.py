@@ -23,7 +23,7 @@ requires = (
 # This call to setup() does all the work
 setup(
     name="synecdoche",
-    version="0.0.4",
+    version="0.0.5",
     description="Synecdoche: Hypernetworks for Haiku in JAX",
     long_description=long_description,
     long_description_content_type="text/markdown",

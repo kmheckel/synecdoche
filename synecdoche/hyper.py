@@ -80,6 +80,7 @@ class DCT(hk.Module):
     def __call__(self):
         embeddings = hk.get_parameter("w", [self.num_tgt_layers, self.embedding_dim],
                                       init=hk.initializers.TruncatedNormal())
+
         
         projections = jax.scipy.fft.idctn(embeddings, s=[self.num_tgt_layers, self.hyper_out_dim])
         # tgt_layers X max_layer_size matrix
@@ -185,7 +186,7 @@ class Hypernetwork(hk.Module):
         rebuilt_tree = tree.tree_unflatten(self.tgt_treedef, layer_projections)
         # this is ugly... sorry...
         resized_tree = tree.tree_map(lambda layer, size: jnp.pad(layer[1,:size], 
-                                                                 (0,jnp.max(0,size-layer.size)), 
+                                                                 (0,max(0,size-layer.size)), 
                                                                  mode="wrap"), 
                                      rebuilt_tree, 
                                      self.tgt_sizes

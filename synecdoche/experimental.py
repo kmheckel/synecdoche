@@ -32,7 +32,7 @@ class DynamicHypernetwork(hk.Module):
                 
         rebuilt_tree = tree.tree_unflatten(self.tgt_treedef, layer_projections)
         resized_tree = tree.tree_map(lambda layer, size: jnp.pad(layer[1,:size], 
-                                                                 (0,jnp.max(0,size-layer.size)), 
+                                                                 (0,max(0,size-layer.size)), 
                                                                  mode="wrap"), 
                                      rebuilt_tree, 
                                      self.tgt_sizes
