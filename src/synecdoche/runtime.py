@@ -232,10 +232,17 @@ class Runtime:
             TraceEvent("call_start", sig.qualname, {"mode": "recursion", "depth": depth})
         )
 
+        # archive_key override lets users pin the archive identity independently of
+        # the signature hash — useful for migrations (same function, different body
+        # history) and branching.
+        archive_key = overrides.archive_key or sig.signature_hash
+
         # Archive lookup — skip compilation on hit.
-        entry = self.archive.get_current(sig.signature_hash, surface.tool_surface_hash)
+        entry = self.archive.get_current(archive_key, surface.tool_surface_hash)
         if entry is None:
-            entry = await self._compile_and_archive(sig, surface, inputs, overrides)
+            entry = await self._compile_and_archive(
+                sig, surface, inputs, overrides, archive_key=archive_key
+            )
             self.tracer.emit(
                 TraceEvent(
                     "compile", sig.qualname, {"version": entry.version, "trigger": entry.trigger}
@@ -270,7 +277,7 @@ class Runtime:
             except Exception as e:
                 elapsed = (time.perf_counter() - t0) * 1000
                 self.archive.record_metrics(
-                    sig.signature_hash,
+                    archive_key,
                     surface.tool_surface_hash,
                     current_entry.version,
                     success=False,
@@ -313,12 +320,13 @@ class Runtime:
                     exception=e,
                     trace_frames=trace_frames,
                     prior_attempts=attempt,
+                    archive_key=archive_key,
                 )
                 continue
             else:
                 elapsed = (time.perf_counter() - t0) * 1000
                 self.archive.record_metrics(
-                    sig.signature_hash,
+                    archive_key,
                     surface.tool_surface_hash,
                     current_entry.version,
                     success=True,
@@ -341,9 +349,10 @@ class Runtime:
         surface: ToolSurface,
         inputs: dict[str, Any],
         overrides: _Overrides,
+        archive_key: str,
     ) -> ArchiveEntry:
         compiler = Compiler(overrides.model) if overrides.model is not None else self._compiler
-        neighbors = tuple(e.body for e in self.archive.neighbors(sig.signature_hash, k=3))
+        neighbors = tuple(e.body for e in self.archive.neighbors(archive_key, k=3))
         ctx = JITContext(
             signature=sig,
             surface=surface,
@@ -353,9 +362,9 @@ class Runtime:
             budget=self.budget,
         )
         body = await compiler.compile(ctx)
-        version = self.archive.next_version(sig.signature_hash, surface.tool_surface_hash)
+        version = self.archive.next_version(archive_key, surface.tool_surface_hash)
         entry = ArchiveEntry(
-            signature_hash=sig.signature_hash,
+            signature_hash=archive_key,
             tool_surface_hash=surface.tool_surface_hash,
             version=version,
             parent_version=None,
@@ -365,7 +374,7 @@ class Runtime:
             promoted=True,
         )
         self.archive.insert(entry)
-        self.archive.promote(sig.signature_hash, surface.tool_surface_hash, version)
+        self.archive.promote(archive_key, surface.tool_surface_hash, version)
         return entry
 
     async def _repair(
@@ -378,6 +387,7 @@ class Runtime:
         exception: BaseException,
         trace_frames: list[TraceFrame],
         prior_attempts: int,
+        archive_key: str,
     ) -> ArchiveEntry:
         repair_input = RepairInput(
             prior_body=prior_entry.body,
@@ -389,9 +399,7 @@ class Runtime:
             signature=sig,
             surface=surface,
             inputs=inputs,
-            archive_neighbors=tuple(
-                e.body for e in self.archive.neighbors(sig.signature_hash, k=3)
-            ),
+            archive_neighbors=tuple(e.body for e in self.archive.neighbors(archive_key, k=3)),
             remaining_depth=self.budget.max_recursion_depth,
             budget=self.budget,
         )
@@ -418,9 +426,9 @@ class Runtime:
                     signature=sig,
                 ) from e
 
-        version = self.archive.next_version(sig.signature_hash, surface.tool_surface_hash)
+        version = self.archive.next_version(archive_key, surface.tool_surface_hash)
         entry = ArchiveEntry(
-            signature_hash=sig.signature_hash,
+            signature_hash=archive_key,
             tool_surface_hash=surface.tool_surface_hash,
             version=version,
             parent_version=prior_entry.version,
@@ -430,7 +438,7 @@ class Runtime:
             promoted=True,
         )
         self.archive.insert(entry)
-        self.archive.promote(sig.signature_hash, surface.tool_surface_hash, version)
+        self.archive.promote(archive_key, surface.tool_surface_hash, version)
         return entry
 
     # ------------------------------------------------------------------
@@ -578,17 +586,51 @@ def _validate_return(sig: CallSignature, value: Any) -> Any:
 
 
 def _unwrap_mcp_result(result: Any) -> Any:
-    """FastMCP's call_tool returns a structured object; we want the payload."""
-    # FastMCP >= 3 returns CallToolResult with .structured_content / .data / .content.
-    for attr in ("data", "structured_content", "content"):
-        if hasattr(result, attr):
-            v = getattr(result, attr)
-            if v is not None:
-                # MCP content is typically a list of TextContent; normalize.
-                if isinstance(v, list) and v and hasattr(v[0], "text"):
-                    return "\n".join(getattr(c, "text", str(c)) for c in v)
-                return v
+    """Normalize FastMCP's CallToolResult (or similar) into a Python value.
+
+    FastMCP >= 3 returns an object with some subset of:
+    - `.structured_content` — a typed dict the server returned (most preferred).
+    - `.data` — server-provided payload (may be the same as structured_content
+      on some versions; empty list when the server returned text content only).
+    - `.content` — a list of typed content parts (TextContent, ImageContent, ...).
+
+    Precedence order:
+      1. `structured_content` (most explicit, server-declared shape)
+      2. `data` — only when it is a non-empty, non-list-of-empty value
+      3. `content` — flatten any TextContent into a newline-joined string
+      4. fall back to the raw object
+    """
+    sc = getattr(result, "structured_content", None)
+    if sc is not None and sc != {} and sc != []:
+        return sc
+
+    data = getattr(result, "data", None)
+    if data is not None and _is_meaningful(data):
+        return data
+
+    content = getattr(result, "content", None)
+    if content is not None:
+        if isinstance(content, list):
+            texts = [getattr(c, "text", None) for c in content]
+            texts = [t for t in texts if t is not None]
+            if texts:
+                return "\n".join(texts)
+            # list of non-text parts — return verbatim so caller can inspect
+            if content:
+                return content
+        else:
+            return content
+
     return result
+
+
+def _is_meaningful(v: Any) -> bool:
+    """True if `v` is not None / empty dict / empty list."""
+    if v is None:
+        return False
+    if isinstance(v, (list, dict, str)) and not v:
+        return False
+    return True
 
 
 def _truncate(v: Any, n: int = 200) -> str:

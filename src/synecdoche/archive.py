@@ -322,14 +322,18 @@ class SqliteArchive:
             self._conn.commit()
 
     def rollback(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None:
-        current = self.get_current(signature_hash, tool_surface_hash)
-        if current is None or current.parent_version is None:
-            return None
-        parent = self.get_version(signature_hash, tool_surface_hash, current.parent_version)
-        if parent is None:
-            return None
-        self.promote(signature_hash, tool_surface_hash, parent.version)
-        return parent
+        # Atomic under a single RLock acquisition — each sub-call re-enters the
+        # same lock rather than a fresh one, so no interleaving promote() can
+        # target the wrong row between our reads and the eventual promotion.
+        with self._lock:
+            current = self.get_current(signature_hash, tool_surface_hash)
+            if current is None or current.parent_version is None:
+                return None
+            parent = self.get_version(signature_hash, tool_surface_hash, current.parent_version)
+            if parent is None:
+                return None
+            self.promote(signature_hash, tool_surface_hash, parent.version)
+            return parent
 
     def history(self, signature_hash: str, tool_surface_hash: str) -> list[ArchiveEntry]:
         with self._lock:
