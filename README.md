@@ -183,6 +183,11 @@ Deferred: soft-signal healing, offline optimization, semantic
 cross-signature search, distributed archives, MCP-server export of
 compiled functions.
 
+## Design doc
+
+The full design spec is at [`docs/design.md`](docs/design.md).
+Open work items live in [GitHub issues](https://github.com/kmheckel/synecdoche/issues).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

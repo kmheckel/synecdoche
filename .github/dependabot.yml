@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      production:
+        dependency-type: "production"
+        update-types: ["patch", "minor"]
+      development:
+        dependency-type: "development"
+        update-types: ["patch", "minor"]
+      ecosystem:
+        patterns:
+          - "pydantic-ai*"
+          - "pydantic-monty"
+          - "fastmcp"
+        update-types: ["patch", "minor", "major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
