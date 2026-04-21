@@ -15,6 +15,7 @@ from .exceptions import FrameworkError, SandboxError
 
 if TYPE_CHECKING:
     from .compiler import GeneratedBody
+    from .helpers import HelperSpec
     from .signature import CallSignature
     from .surface import ToolSurface
 
@@ -33,6 +34,7 @@ class Sandbox(Protocol):
         surface: ToolSurface,
         inputs: dict[str, Any],
         external_functions: dict[str, Callable[..., Awaitable[Any]]],
+        helpers: list[HelperSpec] | None = None,
     ) -> Any: ...
 
 
@@ -69,6 +71,7 @@ def assemble_script(
     signature: CallSignature,
     surface: ToolSurface,
     allowed_imports: set[str] | None = None,
+    helpers: list[HelperSpec] | None = None,
 ) -> AssembledScript:
     """Produce the final script the sandbox will execute.
 
@@ -97,7 +100,8 @@ def assemble_script(
         f"{p.name}: {_type_hint_for_param(p.annotation)}" for p in signature.params
     )
     tool_stubs = surface.render_stubs()
-    stubs = "\n".join(s for s in (input_decls, tool_stubs) if s)
+    helper_stubs = "\n".join(h.render_stub() for h in (helpers or []))
+    stubs = "\n".join(s for s in (input_decls, tool_stubs, helper_stubs) if s)
 
     return AssembledScript(
         source="\n".join(parts),
@@ -161,20 +165,30 @@ class MontySandbox:
         surface: ToolSurface,
         inputs: dict[str, Any],
         external_functions: dict[str, Callable[..., Awaitable[Any]]],
+        helpers: list[HelperSpec] | None = None,
     ) -> Any:
         import pydantic_monty as pm
 
         script = assemble_script(
-            body=body, signature=signature, surface=surface, allowed_imports=self.allowed_imports
+            body=body,
+            signature=signature,
+            surface=surface,
+            allowed_imports=self.allowed_imports,
+            helpers=helpers,
         )
 
+        # If helpers are declared, disable strict type-check: the helper stubs
+        # reference user-defined BaseModel types that don't live inside the
+        # sandbox, and we can't easily inject their class definitions. The
+        # repair loop catches runtime errors anyway.
+        enable_type_check = self.type_check and not helpers
         try:
             monty = pm.Monty(
                 script.source,
                 script_name=f"{signature.qualname.split('.')[-1]}.py",
                 inputs=script.input_names,
-                type_check=self.type_check,
-                type_check_stubs=script.stubs or None,
+                type_check=enable_type_check,
+                type_check_stubs=script.stubs if enable_type_check else None,
             )
         except pm.MontySyntaxError as e:
             raise SandboxError(

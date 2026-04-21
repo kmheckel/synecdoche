@@ -28,7 +28,7 @@ from .archive import (
     now_utc,
     open_archive,
 )
-from .compiler import Compiler, Inferencer
+from .compiler import Compiler, GeneratedBody, Inferencer
 from .exceptions import (
     BudgetExceeded,
     CompilationError,
@@ -36,6 +36,7 @@ from .exceptions import (
     RepairAttempt,
     ValidationError,
 )
+from .helpers import HelperSpec, parse_helper
 from .jit import Budget, JITContext, TraceFrame
 from .repair import RepairInput, build_repair_ctx
 from .sandbox import MontySandbox, Sandbox
@@ -170,10 +171,12 @@ class Runtime:
 
         def wrap(fn: F) -> F:
             sig = CallSignature.from_function(fn)
+            fn_globals = getattr(fn, "__globals__", {}) or {}
             overrides = _Overrides(
                 model=model,
                 max_repair_attempts=max_repair_attempts,
                 archive_key=archive_key,
+                caller_globals=fn_globals,
             )
 
             async def invoke_async(*args: Any, **kwargs: Any) -> Any:
@@ -271,6 +274,7 @@ class Runtime:
             t0 = time.perf_counter()
             trace_frames: list[TraceFrame] = []
             framework_slot: list[FrameworkError] = []
+            helpers = self._parse_helpers(current_entry.body, sig.qualname, overrides)
             external_fns = self._build_external_functions(
                 surface,
                 trace_frames,
@@ -278,6 +282,7 @@ class Runtime:
                 overrides=overrides,
                 frame_start=t0,
                 framework_exc_slot=framework_slot,
+                helpers=helpers,
             )
             try:
                 raw = await self.sandbox.execute(
@@ -286,6 +291,7 @@ class Runtime:
                     surface=surface,
                     inputs=inputs,
                     external_functions=external_fns,
+                    helpers=helpers,
                 )
                 value = _validate_return(sig, raw)
             except Exception as caught:
@@ -448,6 +454,7 @@ class Runtime:
                     : self.shadow_validate_samples
                 ]
             )
+            revised_helpers = self._parse_helpers(revised_body, sig.qualname, _Overrides())
             for sample_inputs, expected in samples:
                 try:
                     external_fns = self._build_external_functions(
@@ -456,6 +463,7 @@ class Runtime:
                         depth=0,
                         overrides=_Overrides(),
                         frame_start=time.perf_counter(),
+                        helpers=revised_helpers,
                     )
                     raw = await self.sandbox.execute(
                         body=revised_body,
@@ -463,6 +471,7 @@ class Runtime:
                         surface=surface,
                         inputs=sample_inputs,
                         external_functions=external_fns,
+                        helpers=revised_helpers,
                     )
                     got = _validate_return(sig, raw)
                 except Exception as e:
@@ -520,6 +529,30 @@ class Runtime:
     # Tool dispatch
     # ------------------------------------------------------------------
 
+    def _parse_helpers(
+        self,
+        body: GeneratedBody,
+        caller_qualname: str,
+        overrides: _Overrides,
+    ) -> list[HelperSpec]:
+        """Resolve each InlineHelper in the body against the caller's globals."""
+        specs: list[HelperSpec] = []
+        for h in body.helpers:
+            try:
+                specs.append(
+                    parse_helper(
+                        h,
+                        caller_qualname=caller_qualname,
+                        globals_dict=overrides.caller_globals,
+                    )
+                )
+            except ValueError:
+                # Skip helpers whose signature we can't parse — the body will
+                # get an undefined-name error inside the sandbox and trigger
+                # repair, which is the right signal for the compiler.
+                continue
+        return specs
+
     def _build_external_functions(
         self,
         surface: ToolSurface,
@@ -529,6 +562,7 @@ class Runtime:
         overrides: _Overrides,
         frame_start: float,
         framework_exc_slot: list[FrameworkError] | None = None,
+        helpers: list[HelperSpec] | None = None,
     ) -> dict[str, Callable[..., Awaitable[Any]]]:
         tool_calls = _Counter()
         budget = self.budget
@@ -586,10 +620,71 @@ class Runtime:
         functions: dict[str, Callable[..., Awaitable[Any]]] = {
             t.name: wrap_mcp(t) for t in surface.tools if t.source == "mcp"
         }
-        # Inline helpers added after initial compile, if any body declared them.
-        # (Rare in POC; usually resolved via the build-time surface expansion
-        # done by the recursion pipeline when it processes body.helpers.)
+
+        # Inline helpers declared by the generated body. `infer` kind dispatches
+        # to an ephemeral Inferencer keyed on the helper's return type;
+        # `recursion` kind recursively calls this Runtime with a synthesized
+        # CallSignature at depth+1.
+        for h in helpers or []:
+            functions[h.name] = self._wrap_helper(
+                h,
+                trace_frames=trace_frames,
+                depth=depth,
+                overrides=overrides,
+                check_budgets=_check_budgets,
+                tool_calls=tool_calls,
+            )
+
         return functions
+
+    def _wrap_helper(
+        self,
+        helper: HelperSpec,
+        *,
+        trace_frames: list[TraceFrame],
+        depth: int,
+        overrides: _Overrides,
+        check_budgets: Callable[[], None],
+        tool_calls: _Counter,
+    ) -> Callable[..., Awaitable[Any]]:
+        helper_sig = helper.signature
+
+        async def dispatch(**kwargs: Any) -> Any:
+            check_budgets()
+            tool_calls.inc()
+            self.tracer.emit(
+                TraceEvent(
+                    "helper_call",
+                    helper.name,
+                    {"kind": helper.kind, "args": _truncate(kwargs)},
+                )
+            )
+            if helper.kind == "infer":
+                key = (helper_sig.return_type, id(self.model_infer))
+                inferencer = self._infer_cache.get(key)
+                if inferencer is None:
+                    inferencer = Inferencer(self.model_infer, helper_sig.return_type)
+                    self._infer_cache[key] = inferencer
+                result = await inferencer.infer(
+                    signature_line=helper_sig.render(),
+                    docstring=helper_sig.docstring,
+                    inputs=kwargs,
+                )
+            else:
+                result = await self._call_recursion(
+                    helper_sig, kwargs, overrides=overrides, depth=depth + 1
+                )
+            trace_frames.append(
+                TraceFrame(
+                    kind="helper",
+                    name=helper.name,
+                    args_summary=_truncate(kwargs),
+                    result_summary=_truncate(result),
+                )
+            )
+            return result
+
+        return dispatch
 
     # ------------------------------------------------------------------
     # Tool-surface bootstrap
@@ -619,10 +714,12 @@ class _Overrides:
         model: Model | None = None,
         max_repair_attempts: int | None = None,
         archive_key: str | None = None,
+        caller_globals: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.max_repair_attempts = max_repair_attempts
         self.archive_key = archive_key
+        self.caller_globals = caller_globals or {}
 
 
 class _Counter:

@@ -44,6 +44,27 @@ class CallSignature:
     signature_hash: str = ""
 
     @classmethod
+    def from_synthetic(
+        cls,
+        *,
+        qualname: str,
+        docstring: str,
+        params: tuple[Param, ...],
+        return_type: Any,
+    ) -> CallSignature:
+        """Build a CallSignature from pre-parsed pieces (no real Python function)."""
+        schema = _json_schema_of(return_type)
+        sig_hash = _hash_signature(qualname=qualname, params=list(params), return_type=return_type)
+        return cls(
+            qualname=qualname,
+            docstring=docstring,
+            params=params,
+            return_type=return_type,
+            return_schema=schema,
+            signature_hash=sig_hash,
+        )
+
+    @classmethod
     def from_function(cls, fn: Callable[..., Any]) -> CallSignature:
         sig = inspect.signature(fn)
         try:
