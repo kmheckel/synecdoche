@@ -28,8 +28,8 @@ The contribution is the layer between them: a single decorator, a two-strategy c
 
 ## 3. Public Interface
 
-See the [README](../README.md) for the current, implemented surface. What follows is the
-aspirational full spec.
+See the [README on GitHub](https://github.com/kmheckel/synecdoche#readme) for the
+current, implemented surface. What follows is the aspirational full spec.
 
 ### 3.1 Runtime Construction
 

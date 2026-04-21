@@ -1,0 +1,80 @@
+site_name: synecdoche
+site_description: JIT AI code synthesis as a functional paradigm
+site_url: https://kmheckel.github.io/synecdoche/
+repo_url: https://github.com/kmheckel/synecdoche
+repo_name: kmheckel/synecdoche
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - toc.integrate
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: false
+            show_signature_annotations: true
+            separate_signature: true
+            merge_init_into_class: true
+            members_order: source
+            docstring_section_style: list
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Quickstart: getting-started/quickstart.md
+      - Install + providers: getting-started/install.md
+      - With Ollama: getting-started/ollama.md
+  - Concepts:
+      - Runtime: concepts/runtime.md
+      - Decorators: concepts/decorators.md
+      - Archive: concepts/archive.md
+      - Repair loop: concepts/repair.md
+      - Sandbox: concepts/sandbox.md
+      - MCP tools: concepts/mcp.md
+      - Exceptions: concepts/exceptions.md
+  - API reference:
+      - Runtime: api/runtime.md
+      - Archive: api/archive.md
+      - Exceptions: api/exceptions.md
+      - Types: api/types.md
+  - Design spec: design.md
