@@ -38,7 +38,7 @@ from .runtime import Runtime
 from .sandbox import MontySandbox, Sandbox
 from .signature import CallSignature, Param
 from .surface import ToolSpec, ToolSurface
-from .trace import CallableTracer, NullTracer, StdoutTracer, TraceEvent, Tracer
+from .trace import CallableTracer, NullTracer, StdoutTracer, TraceEvent, Tracer, TreeTracer
 
 __version__ = "0.1.0"
 
@@ -69,6 +69,7 @@ __all__ = [
     "ToolSurfaceDrift",
     "TraceEvent",
     "Tracer",
+    "TreeTracer",
     "ValidationError",
     "__version__",
 ]
