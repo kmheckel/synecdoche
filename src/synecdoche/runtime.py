@@ -80,6 +80,8 @@ class Runtime:
         max_recursion_depth: int = 6,
         max_tool_calls_per_frame: int = 200,
         wall_time_seconds: float | None = None,
+        # Shadow-validation policy.
+        shadow_validate_samples: int = 3,
         # Observability.
         trace: Any = None,
     ) -> None:
@@ -97,6 +99,9 @@ class Runtime:
         self.heal = heal
         self.max_repair_attempts = max_repair_attempts
         self.shadow_validate = shadow_validate
+        self.shadow_validate_samples = shadow_validate_samples
+        # (archive_key, tool_surface_hash) -> bounded list of (inputs, output).
+        self._success_samples: dict[tuple[str, str], list[tuple[dict[str, Any], Any]]] = {}
         self.budget = Budget(
             max_recursion_depth=max_recursion_depth,
             max_tool_calls_per_frame=max_tool_calls_per_frame,
@@ -355,6 +360,9 @@ class Runtime:
                     success=True,
                     latency_ms=elapsed,
                 )
+                # Record a success sample so later repairs can shadow-validate
+                # against it. Bounded to shadow_validate_samples to cap memory.
+                self._record_success(archive_key, surface.tool_surface_hash, inputs, value)
                 self.tracer.emit(
                     TraceEvent("call_end", sig.qualname, {"mode": "recursion", "ok": True})
                 )
@@ -429,25 +437,46 @@ class Runtime:
         repaired_ctx = build_repair_ctx(base_ctx, repair_input)
         revised_body = await self._compiler.compile(repaired_ctx)
 
-        # Shadow validation: re-run against the failing inputs (at minimum).
+        # Shadow validation: re-run against the failing inputs AND up to N
+        # prior successes. A regression on any prior success rejects the
+        # revision, so a "fix" for one input cannot silently break earlier
+        # ones.
         if self.shadow_validate:
-            try:
-                external_fns = self._build_external_functions(
-                    surface, [], depth=0, overrides=_Overrides(), frame_start=time.perf_counter()
-                )
-                raw = await self.sandbox.execute(
-                    body=revised_body,
-                    signature=sig,
-                    surface=surface,
-                    inputs=inputs,
-                    external_functions=external_fns,
-                )
-                _validate_return(sig, raw)
-            except Exception as e:
-                raise CompilationError(
-                    f"Revised body failed shadow validation: {e}",
-                    signature=sig,
-                ) from e
+            samples: list[tuple[dict[str, Any], Any]] = [(inputs, None)]
+            samples.extend(
+                self._success_samples.get((archive_key, surface.tool_surface_hash), [])[
+                    : self.shadow_validate_samples
+                ]
+            )
+            for sample_inputs, expected in samples:
+                try:
+                    external_fns = self._build_external_functions(
+                        surface,
+                        [],
+                        depth=0,
+                        overrides=_Overrides(),
+                        frame_start=time.perf_counter(),
+                    )
+                    raw = await self.sandbox.execute(
+                        body=revised_body,
+                        signature=sig,
+                        surface=surface,
+                        inputs=sample_inputs,
+                        external_functions=external_fns,
+                    )
+                    got = _validate_return(sig, raw)
+                except Exception as e:
+                    raise CompilationError(
+                        f"Revised body failed shadow validation on inputs={sample_inputs!r}: {e}",
+                        signature=sig,
+                    ) from e
+                # For non-failing samples, also check we didn't regress the output.
+                if expected is not None and got != expected:
+                    raise CompilationError(
+                        f"Revised body regressed on prior-success inputs={sample_inputs!r}: "
+                        f"expected {expected!r}, got {got!r}",
+                        signature=sig,
+                    )
 
         version = self.archive.next_version(archive_key, surface.tool_surface_hash)
         entry = ArchiveEntry(
@@ -463,6 +492,29 @@ class Runtime:
         self.archive.insert(entry)
         self.archive.promote(archive_key, surface.tool_surface_hash, version)
         return entry
+
+    # ------------------------------------------------------------------
+    # Success-sample tracking (for shadow validation breadth)
+    # ------------------------------------------------------------------
+
+    def _record_success(
+        self,
+        archive_key: str,
+        tool_surface_hash: str,
+        inputs: dict[str, Any],
+        value: Any,
+    ) -> None:
+        """Push (inputs, value) onto the per-key samples deque, bounded.
+
+        We only keep the most-recent `shadow_validate_samples` entries.
+        Hashable inputs are assumed — for POC we just store the dict directly.
+        """
+        key = (archive_key, tool_surface_hash)
+        samples = self._success_samples.setdefault(key, [])
+        # Dedupe on the input dict to avoid re-recording repeated calls.
+        samples[:] = [(i, v) for (i, v) in samples if i != inputs]
+        samples.insert(0, (inputs, value))
+        del samples[self.shadow_validate_samples :]
 
     # ------------------------------------------------------------------
     # Tool dispatch

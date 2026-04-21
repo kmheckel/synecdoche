@@ -39,7 +39,11 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["pydantic-ai[anthropic]>=1.0"]
 openai = ["pydantic-ai[openai]>=1.0"]
-all = ["pydantic-ai[anthropic,openai,google]>=1.0"]
+logfire = ["logfire>=3.0"]
+all = [
+    "pydantic-ai[anthropic,openai,google]>=1.0",
+    "logfire>=3.0",
+]
 
 [project.scripts]
 synecdoche = "synecdoche.cli:main"

@@ -2959,10 +2959,14 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "logfire" },
     { name = "pydantic-ai" },
 ]
 anthropic = [
     { name = "pydantic-ai" },
+]
+logfire = [
+    { name = "logfire" },
 ]
 openai = [
     { name = "pydantic-ai" },
@@ -2979,6 +2983,8 @@ dev = [
 requires-dist = [
     { name = "fastmcp", specifier = ">=3.0" },
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "logfire", marker = "extra == 'all'", specifier = ">=3.0" },
+    { name = "logfire", marker = "extra == 'logfire'", specifier = ">=3.0" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-ai", specifier = ">=1.0" },
     { name = "pydantic-ai", extras = ["anthropic"], marker = "extra == 'anthropic'", specifier = ">=1.0" },
@@ -2986,7 +2992,7 @@ requires-dist = [
     { name = "pydantic-ai", extras = ["openai"], marker = "extra == 'openai'", specifier = ">=1.0" },
     { name = "pydantic-monty", specifier = ">=0.0.16" },
 ]
-provides-extras = ["anthropic", "openai", "all"]
+provides-extras = ["anthropic", "openai", "logfire", "all"]
 
 [package.metadata.requires-dev]
 dev = [
