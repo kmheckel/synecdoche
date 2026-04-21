@@ -32,6 +32,7 @@ from .compiler import Compiler, Inferencer
 from .exceptions import (
     BudgetExceeded,
     CompilationError,
+    FrameworkError,
     RepairAttempt,
     ValidationError,
 )
@@ -78,6 +79,7 @@ class Runtime:
         # Budgets.
         max_recursion_depth: int = 6,
         max_tool_calls_per_frame: int = 200,
+        wall_time_seconds: float | None = None,
         # Observability.
         trace: Any = None,
     ) -> None:
@@ -98,6 +100,7 @@ class Runtime:
         self.budget = Budget(
             max_recursion_depth=max_recursion_depth,
             max_tool_calls_per_frame=max_tool_calls_per_frame,
+            wall_time_seconds=wall_time_seconds,
         )
         self.tracer: Tracer = resolve_tracer(trace)
 
@@ -262,8 +265,14 @@ class Runtime:
         for attempt in range(max_repairs + 1):
             t0 = time.perf_counter()
             trace_frames: list[TraceFrame] = []
+            framework_slot: list[FrameworkError] = []
             external_fns = self._build_external_functions(
-                surface, trace_frames, depth=depth, overrides=overrides
+                surface,
+                trace_frames,
+                depth=depth,
+                overrides=overrides,
+                frame_start=t0,
+                framework_exc_slot=framework_slot,
             )
             try:
                 raw = await self.sandbox.execute(
@@ -274,7 +283,13 @@ class Runtime:
                     external_functions=external_fns,
                 )
                 value = _validate_return(sig, raw)
-            except Exception as e:
+            except Exception as caught:
+                # If Monty flattened a framework signal (e.g. BudgetExceeded)
+                # into a MontyRuntimeError / SandboxError, recover the typed
+                # original from the slot. We always prefer the slot's value
+                # when present — SandboxError is a FrameworkError too, but it
+                # lacks the structured fields repair / tests rely on.
+                e: BaseException = framework_slot[-1] if framework_slot else caught
                 elapsed = (time.perf_counter() - t0) * 1000
                 self.archive.record_metrics(
                     archive_key,
@@ -305,6 +320,14 @@ class Runtime:
                     )
                 )
                 if not self.heal or attempt >= max_repairs:
+                    # Let the typed "budget/capability" signals surface directly
+                    # — wrapping them in CompilationError hides the structured
+                    # data the repair prompt relies on. Sandbox / validation
+                    # errors stay wrapped: they indicate the body was bad.
+                    from .exceptions import ContextWindowExceeded, ToolSurfaceDrift
+
+                    if isinstance(e, (BudgetExceeded, ContextWindowExceeded, ToolSurfaceDrift)):
+                        raise e from None
                     raise CompilationError(
                         f"Recursion failed after {attempt + 1} attempt(s): {e}",
                         signature=sig,
@@ -410,7 +433,7 @@ class Runtime:
         if self.shadow_validate:
             try:
                 external_fns = self._build_external_functions(
-                    surface, [], depth=0, overrides=_Overrides()
+                    surface, [], depth=0, overrides=_Overrides(), frame_start=time.perf_counter()
                 )
                 raw = await self.sandbox.execute(
                     body=revised_body,
@@ -452,19 +475,45 @@ class Runtime:
         *,
         depth: int,
         overrides: _Overrides,
+        frame_start: float,
+        framework_exc_slot: list[FrameworkError] | None = None,
     ) -> dict[str, Callable[..., Awaitable[Any]]]:
         tool_calls = _Counter()
+        budget = self.budget
+        # Monty flattens external exceptions into MontyRuntimeError with the
+        # original type lost. To preserve framework signals across the boundary
+        # we stash them in a mutable slot and re-raise after run_async returns.
+        slot = framework_exc_slot if framework_exc_slot is not None else []
+
+        def _raise_framework(exc: FrameworkError) -> None:
+            slot.append(exc)
+            raise exc
+
+        def _check_budgets() -> None:
+            if tool_calls.value >= budget.max_tool_calls_per_frame:
+                _raise_framework(
+                    BudgetExceeded(
+                        kind="tool_calls",
+                        limit=budget.max_tool_calls_per_frame,
+                        measured=tool_calls.value,
+                    )
+                )
+            if budget.wall_time_seconds is not None:
+                elapsed = time.perf_counter() - frame_start
+                if elapsed > budget.wall_time_seconds:
+                    _raise_framework(
+                        BudgetExceeded(
+                            kind="wall_time",
+                            limit=budget.wall_time_seconds,
+                            measured=elapsed,
+                        )
+                    )
 
         def wrap_mcp(tool: ToolSpec) -> Callable[..., Awaitable[Any]]:
             client = self._mcp_clients[tool.mcp_client_id or 0]
 
             async def invoke(**kwargs: Any) -> Any:
-                if tool_calls.value >= self.budget.max_tool_calls_per_frame:
-                    raise BudgetExceeded(
-                        kind="tool_calls",
-                        limit=self.budget.max_tool_calls_per_frame,
-                        measured=tool_calls.value,
-                    )
+                _check_budgets()
                 tool_calls.inc()
                 self.tracer.emit(TraceEvent("tool_call", tool.name, {"args": _truncate(kwargs)}))
                 async with client:

@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .exceptions import SandboxError
+from .exceptions import FrameworkError, SandboxError
 
 if TYPE_CHECKING:
     from .compiler import GeneratedBody
@@ -194,7 +194,17 @@ class MontySandbox:
                 inputs=inputs,
                 external_functions=external_functions,
             )
+        except FrameworkError:
+            # Framework signals (BudgetExceeded, ContextWindowExceeded, etc.)
+            # are first-class control flow — let them propagate untouched so
+            # the repair loop can pattern-match on them.
+            raise
         except pm.MontyError as e:
+            # Monty may wrap an external-function exception in its own error
+            # type; unwrap to a FrameworkError if that's what the body raised.
+            cause = e.__cause__
+            if isinstance(cause, FrameworkError):
+                raise cause from None
             raise SandboxError(
                 f"Sandbox execution error: {e}",
                 signature=signature,
