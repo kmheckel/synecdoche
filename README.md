@@ -1,81 +1,157 @@
 # synecdoche
 
-**JIT AI code synthesis as a functional paradigm.**
-
-Write a typed Python function signature. Decorate it. At first call, an LLM
-compiles a body, runs it in a sandbox, archives the result, and self-heals
-from exceptions on the next run.
-
-No `Agent` classes. No ambient state. No conversation history. Just types
-and decorators.
+**The part stands for the whole.** You write the part — a typed signature
+and a sentence of intent. The runtime supplies the whole: a body, compiled
+by a neural sequence model, sandboxed, archived, and evolved under
+selection pressure from types, exceptions, and feedback.
 
 ```python
+from pathlib import Path
 from pydantic import BaseModel
 from pydantic_ai.models.anthropic import AnthropicModel
 from synecdoche import Runtime
 
-class Sentiment(BaseModel):
-    label: str
-    confidence: float
-
 rt = Runtime(model=AnthropicModel("claude-sonnet-4-6"))
 
-@rt.infer
-def classify_sentiment(text: str) -> Sentiment:
+@rt.fn                      # solid — your body, and it self-heals
+def parse_semver(version: str) -> tuple[int, int, int]:
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
+
+@rt.fn                      # synth — the body is grown at first call
+def summarize(root: Path) -> Summary:
+    """Summarize the architecture of the codebase at root."""
+
+@rt.fn(mode="oracle")       # oracle — the model *is* the body
+def sentiment(text: str) -> Sentiment:
     """Classify sentiment as positive, negative, or neutral."""
-
-print(classify_sentiment("I love this!"))
-# label='positive' confidence=0.95
 ```
 
-## The idea
+One decorator. Three phases of the same matter.
 
-Most agent frameworks are object-oriented at their core: you subclass an
-`Agent`, register `@tool`s on it, and thread state through `self`. The
-surface area of the framework grows with every new capability.
+## Code is a phase of matter
 
-synecdoche is the opposite bet: **one runtime, two decorators, types
-everywhere, MCP for effects, sandbox for execution, exceptions as the
-repair signal.**
+Most frameworks draw a hard line between the code you write and the code a
+model writes. synecdoche's bet is that the line is a phase boundary, not a
+wall — and that a function should be able to cross it in both directions
+without the call site changing:
+
+| phase | what it is | how it runs |
+|---|---|---|
+| **solid** | a handwritten body | natively — it's your trusted code |
+| **synth** | a generated body | sandboxed, archived, evolvable |
+| **oracle** | no body at all | one typed inference per call |
+
+The contract — `def name(params) -> Return:` plus a docstring — is the
+fixed point. The implementation is fluid:
+
+- A handwritten body is registered as the **seed** (generation zero) of a
+  lineage. When it raises, the exception doesn't unwind to your caller —
+  it becomes a signal, and the seed *melts*: the runtime mutates it into a
+  sandboxed descendant that fixes the defect and serves the call.
+- A synthesized champion can be **frozen** the other way:
+  `fn.solidify("fn.py")` renders it back into committable source, with its
+  provenance in the header. Decorate it again and it's the seed of the
+  next lineage. Metamorphosis is the workflow, not a trick.
+
+## Everything is variation
+
+There is exactly one way code comes into being here — a **variation
+operator** applied to parents under signals:
+
+| operator | parents | produced by |
+|---|---|---|
+| `spawn` | 0 | first call of a synth fn; exploration during `evolve()` |
+| `mutate` | 1 | healing (hard signal), `backward()` (soft signals), `evolve()` |
+| `cross` | 2 | `evolve()` recombining the top two variants |
+
+"Repair" is not a subsystem; it's `mutate` under an exception. Offline
+optimization is not a subsystem; it's the same operators run in a loop
+with measured fitness. The compiler has one entrypoint — `vary` — and the
+prompt simply renders whichever parents and signals the variation carries.
+
+Every variant lands in the **archive**: a cache (champion lookup skips
+compilation), a fossil record (lineage is never rewritten), and a gene
+pool (parents and cross-signature style neighbors are drawn from it).
+
+## Exceptions and feedback are gradients
+
+The landscape a body lives on is not differentiable, so synecdoche uses
+the two gradient surrogates code actually has:
+
+- **Hard gradients** — exceptions and validation failures, weight −1.
+  Structured exceptions are the richest signal you can emit: a
+  `BudgetExceeded(kind="tool_calls", limit=200, measured=214)` teaches the
+  compiler exactly what to fix. Raise rich exceptions; they are the API.
+- **Soft gradients** — graded feedback:
+
+```python
+result = summarize(Path("."))
+summarize.feedback(0.3, "missed the tests directory entirely")
+summarize.backward()        # textual gradient step: mutate under the
+                            # accumulated signals, shadow-validate, promote
+```
+
+Both kinds flow through the same `Signal` type into the same `mutate`
+operator. `backward()` is descent; the archive is the optimizer state.
+
+## Evolution, when you want it deliberate
+
+Online, selection is ambient — failures demote, descendants promote. When
+you have examples, run it as an explicit evolutionary loop:
+
+```python
+report = summarize.evolve(
+    [{"root": Path("./demo-repo")}, {"root": Path("./other-repo")}],
+    generations=3,
+    population=4,
+    score=lambda inputs, out: judge(out),   # optional; default = validated success
+)
+print(f"champion v{report.champion.version} fitness={report.champion.fitness:.2f}")
+```
+
+Each generation breeds `population` offspring — mutations of the fittest,
+crossovers of the top two, fresh spawns — scores every one against all
+examples, and promotes the overall champion.
+
+## Every function is reflective
+
+`@rt.fn` returns an `Fn`: callable exactly like the function you wrote,
+and also an object about itself.
+
+```python
+summarize.mode          # 'solid' | 'synth' | 'oracle'
+summarize.champion      # the Variant currently serving calls
+summarize.lineage()     # every variant ever bred, with operators and parents
+summarize.signals()     # everything recorded against the champion
+summarize.feedback(s, note)   # soft gradient
+summarize.backward()    # gradient step
+summarize.evolve(...)   # offline evolution
+summarize.solidify()    # freeze the champion into source
+summarize.rollback()    # demote the champion to its parent
+```
+
+## The machinery
 
 ```
-┌──────────────────┐
-│  @rt.infer       │  terminal — one structured-output call, returns typed value
-│  @rt.recursion   │  non-terminal — LLM emits a Python body, runs in a sandbox
-└──────────────────┘
+contract ──> champion lookup ──> execute (native | sandbox) ──> validate ──> value
+                 │ miss                     │ raise
+                 ▼                          ▼
+               vary(spawn)              signal recorded
+                                        vary(mutate) ──> descendant promoted ──> retry
 ```
 
-Behind the decorators:
-
-- [**pydantic-ai**](https://ai.pydantic.dev/) — provider-agnostic model
-  abstraction and structured output. Swap Anthropic for OpenAI, Gemini,
-  Ollama, or anything else it supports without touching synecdoche.
+- [**pydantic-ai**](https://ai.pydantic.dev/) — provider-agnostic models
+  and structured output. Swap Anthropic for OpenAI, Gemini, Ollama, or
+  anything else it supports without touching synecdoche.
 - [**FastMCP**](https://gofastmcp.com/) — the tool surface. Mount MCP
-  servers on the runtime and generated bodies call them uniformly. No
-  `@tool` decorator in synecdoche itself — tool definitions live where
-  they belong.
-- [**pydantic-monty**](https://pydantic.dev/articles/pydantic-monty) —
-  a sandboxed Python interpreter that yields at external calls so the
-  host can dispatch them.
-
-## How it works
-
-When you call a `@rt.recursion` function for the first time:
-
-1. The runtime computes a `(signature_hash, tool_surface_hash)` key.
-2. Miss in archive → the compiler is invoked with the signature, return
-   type schema, tool surface, and inputs. It emits a structured
-   `GeneratedBody` containing the `solve` function source.
-3. The sandbox assembles imports + type stubs + the body, type-checks it,
-   and executes it. Every external call (MCP tool, inline helper) yields
-   out of Monty and is dispatched by the host.
-4. The return value is validated against the declared return type.
-5. On success: archived, promoted, returned.
-6. On failure: the exception (with its structured args) becomes the input
-   to a *repair* compilation. The revised body is shadow-validated
-   against the failing inputs before being promoted.
-
-Subsequent calls: cache hit. The archived body runs directly.
+  servers on the runtime; generated bodies call them uniformly. The
+  surface is hashed, so a changed tool schema is a changed world: variants
+  bred against the old surface don't leak into the new one.
+- [**pydantic-monty**](https://pydantic.dev/articles/pydantic-monty) — a
+  sandboxed Python interpreter that yields at external calls so the host
+  dispatches them. Generated code never touches your process, your
+  filesystem, or the network directly.
 
 ## Installation
 
@@ -91,102 +167,62 @@ For providers:
 uv add "synecdoche[anthropic]"   # or [openai], [all]
 ```
 
-## Usage
-
-### `@rt.infer` — terminal inference
-
-A single typed structured-output call. No sandbox, no archive.
-
-```python
-@rt.infer
-def detect_language(text: str) -> Language:
-    """Identify the natural language of the given text."""
-```
-
-### `@rt.recursion` — compiled body
-
-The compiler synthesizes a body that may call MCP tools and inline
-`@ai.infer` / `@ai.recursion` helpers. The body is archived and reused.
-
-```python
-@rt.recursion
-def summarize_codebase(root: Path) -> Summary:
-    """Summarize the architecture of a codebase at the given root."""
-```
-
-### Per-call overrides
-
-```python
-@rt.infer(model=AnthropicModel("claude-opus-4-7"))
-def detect_subtle_bias(text: str) -> BiasReport: ...
-
-@rt.recursion(
-    model=AnthropicModel("claude-sonnet-4-6"),
-    max_repair_attempts=4,
-)
-def list_recent_files(root: Path) -> list[Path]: ...
-```
-
-### Runtime configuration
+## Runtime configuration
 
 ```python
 rt = Runtime(
     # Either a single model…
     model=AnthropicModel("claude-sonnet-4-6"),
     # …or split by role:
-    # model_recursion=AnthropicModel("claude-opus-4-7"),
-    # model_infer=AnthropicModel("claude-haiku-4-5"),
+    # model_code=AnthropicModel("claude-opus-4-7"),     # compiles bodies
+    # model_oracle=AnthropicModel("claude-haiku-4-5"),  # answers oracles
 
     mcp=[
         Client("stdio://mcp-server-filesystem"),
         Client("https://tools.example.com/mcp"),
     ],
 
-    archive="./.archive",           # or path, or custom Archive impl
-    heal=True,
-    max_repair_attempts=2,
-    shadow_validate=True,
+    archive="./.archive",       # path -> SQLite; omit -> in-memory; or your own Archive
+    heal=True,                  # melt failing champions into descendants
+    max_repairs=2,              # mutation attempts per call
+    shadow_validate=True,       # backward() validates before promoting
     max_recursion_depth=6,
-    trace="stdout",                 # or a callable, or a Tracer instance
+    trace="stdout",             # or a callable, or a Tracer instance
 )
 ```
 
-## Rich exceptions are the API
+Per-function overrides:
 
-The repair compiler is only as good as the information you give it. A raw
-`ValueError("something went wrong")` teaches it nothing. A structured
-exception carrying `{ "measured": 2_100_000, "limit": 200_000, "at_call":
-"derive_summary" }` teaches it exactly what to fix.
-
-Framework-defined exceptions the compiler learns to recognize:
-
-- `ContextWindowExceeded(measured, limit, at_call)`
-- `ToolSurfaceDrift(tool_name, expected_schema, actual_schema)`
-- `BudgetExceeded(kind, limit, measured)`
-
-Your own exceptions can carry anything — the more structure, the better
-the repair.
+```python
+@rt.fn(model=AnthropicModel("claude-opus-4-7"), max_repairs=4)
+def gnarly(root: Path) -> Report:
+    """..."""
+```
 
 ## Status
 
-This is a **proof of concept** exploring what a functional, type-first
-alternative to OOP agent frameworks looks like. Expect the API to evolve.
+A **proof of concept** exploring what a functional, type-first,
+evolutionary alternative to OOP agent frameworks looks like. Expect the
+API to keep evolving — it would be embarrassing if it didn't.
 
-Milestones implemented:
+Implemented:
 
-- [x] M1: Core compiler + sandbox loop.
-- [x] M2: SQLite archive + caching + tool-surface invalidation.
-- [x] M3: Exception-driven repair with shadow validation.
-- [ ] M4: Full observability (Logfire) and archive CLI.
+- [x] One decorator across solid / synth / oracle; seeds heal by melting.
+- [x] Unified variation (`spawn` / `mutate` / `cross`) with signals as the
+      only compile context; SQLite + in-memory population archives with
+      lineage, metrics, and signals.
+- [x] Soft gradients: `feedback()` / `backward()` with shadow validation.
+- [x] Offline evolution: `evolve()` with fitness measurement and champion
+      promotion; `solidify()` back to source.
 
-Deferred: soft-signal healing, offline optimization, semantic
-cross-signature search, distributed archives, MCP-server export of
-compiled functions.
+Deferred: inline-helper dispatch inside generated bodies, semantic
+neighbor search, full observability (Logfire), archive CLI, distributed
+archives, MCP-server export of compiled functions.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
 The `synecdoche` name has been on PyPI since 2023 (originally a JAX/Haiku
-hypernetwork experiment); this POC reuses it with the original author's
-permission for a rewrite under the same MIT terms.
+hypernetwork experiment); this project reuses it with the original
+author's permission for a rewrite under the same MIT terms.

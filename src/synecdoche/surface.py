@@ -8,7 +8,7 @@ The surface has two kinds of entries:
   The runtime dispatches them by recursively compiling/executing the helper
   under the same pipeline.
 
-We compute a `tool_surface_hash` over the MCP portion only — inline helpers
+We compute a `surface_hash` over the MCP portion only — inline helpers
 are body-local and don't invalidate archive entries.
 """
 
@@ -56,17 +56,17 @@ class ToolSpec:
 @dataclass
 class ToolSurface:
     tools: tuple[ToolSpec, ...] = field(default_factory=tuple)
-    tool_surface_hash: str = ""
+    surface_hash: str = ""
 
     def with_inline_helpers(self, helpers: list[ToolSpec]) -> ToolSurface:
         """Return a new surface with body-local inline helpers appended.
 
-        Does not recompute `tool_surface_hash` — helpers are body-local and
+        Does not recompute `surface_hash` — helpers are body-local and
         don't affect cross-run identity.
         """
         return ToolSurface(
             tools=tuple(self.tools) + tuple(helpers),
-            tool_surface_hash=self.tool_surface_hash,
+            surface_hash=self.surface_hash,
         )
 
     def render_stubs(self) -> str:
@@ -102,7 +102,7 @@ async def build_mcp_surface(clients: list[Client]) -> ToolSurface:
                 )
     return ToolSurface(
         tools=tuple(tools),
-        tool_surface_hash=_hash_surface(tools),
+        surface_hash=_hash_surface(tools),
     )
 
 

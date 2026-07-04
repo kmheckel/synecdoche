@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Literal
 
+import pytest
 from pydantic import BaseModel
 
-from synecdoche import Runtime
+from synecdoche import FrameworkError, Runtime
 
 
 class Sentiment(BaseModel):
@@ -12,11 +13,11 @@ class Sentiment(BaseModel):
     confidence: float
 
 
-def test_infer_returns_typed_model(stub_model) -> None:
+def test_oracle_returns_typed_model(stub_model) -> None:
     stub_model.push({"label": "positive", "confidence": 0.9})
     rt = Runtime(model=stub_model.as_model())
 
-    @rt.infer
+    @rt.fn(mode="oracle")
     def classify(text: str) -> Sentiment:
         """Classify sentiment."""
 
@@ -26,11 +27,7 @@ def test_infer_returns_typed_model(stub_model) -> None:
     assert result.confidence == 0.9
 
 
-def test_infer_validates_return_type(stub_model) -> None:
-    # Push a payload that pydantic-ai's own tool-call validator catches
-    # first — it returns a wrapped/retried response. Here we push a valid
-    # payload to confirm the happy path, then push a second call with a
-    # completely different model to confirm the runtime routes correctly.
+def test_infer_alias_still_works(stub_model) -> None:
     stub_model.push({"label": "neutral", "confidence": 0.5})
     rt = Runtime(model=stub_model.as_model())
 
@@ -41,7 +38,7 @@ def test_infer_validates_return_type(stub_model) -> None:
     assert classify("x").label == "neutral"
 
 
-def test_infer_per_call_model_override(stub_model) -> None:
+def test_oracle_per_fn_model_override(stub_model) -> None:
     primary = stub_model.as_model()
     other_stub = type(stub_model)()  # fresh StubModel
     other_stub.push({"label": "negative", "confidence": 0.1})
@@ -49,9 +46,22 @@ def test_infer_per_call_model_override(stub_model) -> None:
 
     rt = Runtime(model=primary)
 
-    @rt.infer(model=other)
+    @rt.fn(mode="oracle", model=other)
     def classify(text: str) -> Sentiment:
         """."""
 
     result = classify("meh")
     assert result.label == "negative"
+
+
+def test_oracle_has_no_lineage(stub_model) -> None:
+    rt = Runtime(model=stub_model.as_model())
+
+    @rt.fn(mode="oracle")
+    def classify(text: str) -> Sentiment:
+        """."""
+
+    with pytest.raises(FrameworkError):
+        classify.lineage()
+    with pytest.raises(FrameworkError):
+        classify.feedback(0.5)

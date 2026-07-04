@@ -1,11 +1,11 @@
-"""Minimal @rt.infer example — one typed function, no MCP needed.
+"""Minimal oracle example — the model *is* the function body.
 
 Run:
 
-    ANTHROPIC_API_KEY=sk-... uv run python examples/hello_infer.py
+    ANTHROPIC_API_KEY=sk-... uv run python examples/hello_oracle.py
 
-This exercises the Runtime's inference path only: the model emits a
-structured value that satisfies the declared return type.
+This exercises the liquid end of the spectrum: one typed inference per
+call, validated against the declared return type, nothing archived.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ rt = Runtime(
 )
 
 
-@rt.infer
+@rt.fn(mode="oracle")
 def classify_sentiment(text: str) -> Sentiment:
     """Classify the sentiment of the given text as positive, negative, or neutral.
 

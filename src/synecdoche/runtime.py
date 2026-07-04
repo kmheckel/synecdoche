@@ -1,20 +1,30 @@
-"""The Runtime: the orchestrator a user interacts with.
+"""The Runtime: models, tools, archive, sandbox — and the selection loop.
 
-Responsibilities:
-- Hold model / MCP / archive / sandbox configuration.
-- Provide the `@rt.infer` and `@rt.recursion` decorators.
-- Dispatch each call through the right pipeline, handling caching, repair,
-  and trace emission.
+The Runtime owns the machinery; ``Fn`` handles own the contracts. One
+decorator, ``@rt.fn``, covers the whole spectrum:
 
-Decorated callables are sync by default; they detect a running event loop
-and use `await`able returns when called from async code.
+    @rt.fn                      # handwritten body -> solid (seed of a lineage)
+    def total(xs: list[float]) -> float:
+        return sum(xs)
+
+    @rt.fn                      # empty body -> synth (spawned at first call)
+    def summarize(root: Path) -> Summary:
+        \"\"\"Summarize the architecture of the codebase at root.\"\"\"
+
+    @rt.fn(mode="oracle")       # no code at all -> one typed inference per call
+    def sentiment(text: str) -> Sentiment:
+        \"\"\"Classify sentiment.\"\"\"
+
+Every call resolves the same way: find the champion variant for
+``(signature, tool surface)``, execute it (natively if it is your seed,
+sandboxed if it was generated), validate the result against the declared
+return type, record the evidence. Failure is not an error path — it is the
+selection pressure that produces the next variant.
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
-import inspect
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -22,21 +32,17 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pydantic import TypeAdapter
 
-from .archive import (
-    Archive,
-    ArchiveEntry,
-    now_utc,
-    open_archive,
-)
-from .compiler import Compiler, Inferencer
+from .archive import Archive, Variant, now_utc, open_archive
+from .compiler import Compiler, GeneratedBody, Inferencer
+from .evolution import Budget, Operator, Signal, TraceFrame, Variation
 from .exceptions import (
     BudgetExceeded,
     CompilationError,
+    FrameworkError,
     RepairAttempt,
     ValidationError,
 )
-from .jit import Budget, JITContext, TraceFrame
-from .repair import RepairInput, build_repair_ctx
+from .fn import EvolutionReport, Fn, Mode
 from .sandbox import MontySandbox, Sandbox
 from .signature import CallSignature
 from .surface import ToolSpec, ToolSurface, build_mcp_surface
@@ -46,34 +52,28 @@ if TYPE_CHECKING:
     from fastmcp import Client
     from pydantic_ai.models import Model
 
-T = TypeVar("T")
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-# ---------------------------------------------------------------------------
-# Runtime
-# ---------------------------------------------------------------------------
-
-
 class Runtime:
-    """The top-level object: owns all configuration and hosts decorators."""
+    """The top-level object: owns all configuration and hosts the decorator."""
 
     def __init__(
         self,
         *,
         # Models — either a single one or split by role.
         model: Model | None = None,
-        model_recursion: Model | None = None,
-        model_infer: Model | None = None,
+        model_code: Model | None = None,  # compiles bodies (spawn/mutate/cross)
+        model_oracle: Model | None = None,  # answers oracle fns
         # External capability surface.
         mcp: list[Client] | None = None,
         # Storage.
         archive: str | Path | Archive | None = None,
         # Sandbox.
         sandbox: Sandbox | None = None,
-        # Repair policy.
+        # Healing policy.
         heal: bool = True,
-        max_repair_attempts: int = 2,
+        max_repairs: int = 2,
         shadow_validate: bool = True,
         # Budgets.
         max_recursion_depth: int = 6,
@@ -81,19 +81,19 @@ class Runtime:
         # Observability.
         trace: Any = None,
     ) -> None:
-        if model is None and (model_recursion is None or model_infer is None):
+        if model is None and (model_code is None or model_oracle is None):
             raise ValueError(
-                "Provide either `model=...` or both `model_recursion=` and `model_infer=`."
+                "Provide either `model=...` or both `model_code=` and `model_oracle=`."
             )
-        self.model_recursion: Model = model_recursion or model  # type: ignore[assignment]
-        self.model_infer: Model = model_infer or model  # type: ignore[assignment]
+        self.model_code: Model = model_code or model  # type: ignore[assignment]
+        self.model_oracle: Model = model_oracle or model  # type: ignore[assignment]
 
         self._mcp_clients: list[Client] = list(mcp or [])
         self.archive: Archive = open_archive(archive)
         self.sandbox: Sandbox = sandbox or MontySandbox()
 
         self.heal = heal
-        self.max_repair_attempts = max_repair_attempts
+        self.max_repairs = max_repairs
         self.shadow_validate = shadow_validate
         self.budget = Budget(
             max_recursion_depth=max_recursion_depth,
@@ -106,183 +106,155 @@ class Runtime:
         self._surface_lock = asyncio.Lock()
 
         # Per-runtime compiler (caches system-prompt prefix inside pydantic-ai).
-        self._compiler = Compiler(self.model_recursion)
+        self._compiler = Compiler(self.model_code)
 
-        # Inferencer agents keyed by return-type, lazy init.
-        self._infer_cache: dict[Any, Inferencer] = {}
+        # Oracle agents keyed by return-type, lazy init.
+        self._oracle_cache: dict[Any, Inferencer] = {}
 
     # ------------------------------------------------------------------
-    # Decorators
+    # The decorator
     # ------------------------------------------------------------------
 
     @overload
-    def infer(self, fn: F) -> F: ...
+    def fn(self, fn: F) -> F: ...
     @overload
-    def infer(self, *, model: Model | None = None) -> Callable[[F], F]: ...
-    def infer(
-        self,
-        fn: F | None = None,
-        *,
-        model: Model | None = None,
-    ) -> F | Callable[[F], F]:
-        """Decorator: mark a function as resolved by a single typed inference."""
-
-        def wrap(fn: F) -> F:
-            sig = CallSignature.from_function(fn)
-
-            async def invoke_async(*args: Any, **kwargs: Any) -> Any:
-                inputs = _bind_inputs(fn, args, kwargs)
-                return await self._call_infer(sig, inputs, model_override=model)
-
-            return _wrap_callable(fn, invoke_async)  # type: ignore[return-value]
-
-        if fn is not None:
-            return wrap(fn)  # type: ignore[return-value]
-        return wrap
-
-    @overload
-    def recursion(self, fn: F) -> F: ...
-    @overload
-    def recursion(
+    def fn(
         self,
         *,
+        mode: Mode | str = "auto",
         model: Model | None = None,
-        max_repair_attempts: int | None = None,
-        archive_key: str | None = None,
+        max_repairs: int | None = None,
     ) -> Callable[[F], F]: ...
+    def fn(
+        self,
+        fn: F | None = None,
+        *,
+        mode: Mode | str = "auto",
+        model: Model | None = None,
+        max_repairs: int | None = None,
+    ) -> F | Callable[[F], F]:
+        """Bind a typed contract to this runtime.
+
+        ``mode='auto'`` reads the function itself: a real body makes it
+        solid, an empty body makes it synth. Pass ``mode='oracle'`` for pure
+        inference, or force ``'solid'``/``'synth'`` explicitly.
+        """
+
+        def wrap(f: F) -> F:
+            return Fn(self, f, mode=mode, model=model, max_repairs=max_repairs)  # type: ignore[return-value]
+
+        if fn is not None:
+            return wrap(fn)
+        return wrap
+
+    # Aliases from the previous API, kept as sugar over fn().
+    def infer(self, fn: F | None = None, *, model: Model | None = None):
+        """Sugar for ``fn(mode='oracle')``."""
+        if fn is not None:
+            return self.fn(mode="oracle")(fn)
+        return self.fn(mode="oracle", model=model)
+
     def recursion(
         self,
         fn: F | None = None,
         *,
         model: Model | None = None,
         max_repair_attempts: int | None = None,
-        archive_key: str | None = None,
-    ) -> F | Callable[[F], F]:
-        """Decorator: mark a function whose body is compiled by an LLM at first call."""
-
-        def wrap(fn: F) -> F:
-            sig = CallSignature.from_function(fn)
-            overrides = _Overrides(
-                model=model,
-                max_repair_attempts=max_repair_attempts,
-                archive_key=archive_key,
-            )
-
-            async def invoke_async(*args: Any, **kwargs: Any) -> Any:
-                inputs = _bind_inputs(fn, args, kwargs)
-                return await self._call_recursion(sig, inputs, overrides=overrides, depth=0)
-
-            return _wrap_callable(fn, invoke_async)  # type: ignore[return-value]
-
+    ):
+        """Sugar for ``fn(mode='synth')``."""
         if fn is not None:
-            return wrap(fn)  # type: ignore[return-value]
-        return wrap
+            return self.fn(mode="synth")(fn)
+        return self.fn(mode="synth", model=model, max_repairs=max_repair_attempts)
 
     # ------------------------------------------------------------------
-    # Infer pipeline
+    # Oracle pipeline
     # ------------------------------------------------------------------
 
-    async def _call_infer(
-        self,
-        sig: CallSignature,
-        inputs: dict[str, Any],
-        *,
-        model_override: Model | None,
-    ) -> Any:
-        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"mode": "infer"}))
-        model = model_override or self.model_infer
+    async def _call_oracle(self, fn: Fn, inputs: dict[str, Any]) -> Any:
+        sig = fn.signature
+        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"mode": "oracle"}))
+        model = fn._model or self.model_oracle
         key = (sig.return_type, id(model))
-        inferencer = self._infer_cache.get(key)
-        if inferencer is None:
-            inferencer = Inferencer(model, sig.return_type)
-            self._infer_cache[key] = inferencer
+        oracle = self._oracle_cache.get(key)
+        if oracle is None:
+            oracle = Inferencer(model, sig.return_type)
+            self._oracle_cache[key] = oracle
         try:
-            value = await inferencer.infer(
+            value = await oracle.infer(
                 signature_line=sig.render(),
                 docstring=sig.docstring,
                 inputs=inputs,
             )
         except Exception as e:
             self.tracer.emit(
-                TraceEvent("call_end", sig.qualname, {"mode": "infer", "error": type(e).__name__})
+                TraceEvent("call_end", sig.qualname, {"mode": "oracle", "error": type(e).__name__})
             )
             raise
-        self.tracer.emit(TraceEvent("call_end", sig.qualname, {"mode": "infer"}))
+        self.tracer.emit(TraceEvent("call_end", sig.qualname, {"mode": "oracle"}))
         return _validate_return(sig, value)
 
     # ------------------------------------------------------------------
-    # Recursion pipeline
+    # Code pipeline (solid + synth): champion -> execute -> select
     # ------------------------------------------------------------------
 
-    async def _call_recursion(
-        self,
-        sig: CallSignature,
-        inputs: dict[str, Any],
-        *,
-        overrides: _Overrides,
-        depth: int,
-    ) -> Any:
+    async def _call_fn(self, fn: Fn, inputs: dict[str, Any], *, depth: int = 0) -> Any:
+        sig = fn.signature
         if depth > self.budget.max_recursion_depth:
             raise BudgetExceeded(
                 kind="depth", limit=self.budget.max_recursion_depth, measured=depth
             )
 
         surface = await self._ensure_surface()
-        self.tracer.emit(
-            TraceEvent("call_start", sig.qualname, {"mode": "recursion", "depth": depth})
-        )
+        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"mode": fn.mode, "depth": depth}))
 
-        # Archive lookup — skip compilation on hit.
-        entry = self.archive.get_current(sig.signature_hash, surface.tool_surface_hash)
-        if entry is None:
-            entry = await self._compile_and_archive(sig, surface, inputs, overrides)
-            self.tracer.emit(
-                TraceEvent(
-                    "compile", sig.qualname, {"version": entry.version, "trigger": entry.trigger}
-                )
-            )
+        champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
+        if champion is None:
+            champion = await self._genesis(fn, surface, inputs)
         else:
-            self.tracer.emit(TraceEvent("cache_hit", sig.qualname, {"version": entry.version}))
+            self.tracer.emit(TraceEvent("cache_hit", sig.qualname, {"version": champion.version}))
 
-        max_repairs = (
-            overrides.max_repair_attempts
-            if overrides.max_repair_attempts is not None
-            else self.max_repair_attempts
-        )
+        fn._last_inputs = dict(inputs)
+        max_repairs = fn._max_repairs if fn._max_repairs is not None else self.max_repairs
         attempts: list[RepairAttempt] = []
-        current_entry = entry
 
         for attempt in range(max_repairs + 1):
             t0 = time.perf_counter()
             trace_frames: list[TraceFrame] = []
-            external_fns = self._build_external_functions(
-                surface, trace_frames, depth=depth, overrides=overrides
-            )
             try:
-                raw = await self.sandbox.execute(
-                    body=current_entry.body,
-                    signature=sig,
-                    surface=surface,
-                    inputs=inputs,
-                    external_functions=external_fns,
-                )
+                if champion.operator == "seed":
+                    raw = await self._execute_native(fn, inputs)
+                else:
+                    external_fns = self._build_external_functions(surface, trace_frames)
+                    raw = await self.sandbox.execute(
+                        body=champion.body,
+                        signature=sig,
+                        surface=surface,
+                        inputs=inputs,
+                        external_functions=external_fns,
+                    )
                 value = _validate_return(sig, raw)
             except Exception as e:
                 elapsed = (time.perf_counter() - t0) * 1000
                 self.archive.record_metrics(
                     sig.signature_hash,
-                    surface.tool_surface_hash,
-                    current_entry.version,
+                    surface.surface_hash,
+                    champion.version,
                     success=False,
                     latency_ms=elapsed,
                     validation_failure=isinstance(e, ValidationError),
                 )
+                self.archive.record_signal(
+                    sig.signature_hash,
+                    surface.surface_hash,
+                    champion.version,
+                    Signal.from_exception(e, trace_frames),
+                )
                 attempts.append(
                     RepairAttempt(
-                        version=current_entry.version,
+                        version=champion.version,
                         exception_type=type(e).__name__,
                         exception_message=str(e),
-                        body_excerpt=current_entry.body.body[:200],
+                        body_excerpt=champion.body.body[:200],
                     )
                 )
                 self.tracer.emit(
@@ -290,7 +262,7 @@ class Runtime:
                         "call_end",
                         sig.qualname,
                         {
-                            "mode": "recursion",
+                            "mode": fn.mode,
                             "ok": False,
                             "error": type(e).__name__,
                             "attempt": attempt,
@@ -299,33 +271,23 @@ class Runtime:
                 )
                 if not self.heal or attempt >= max_repairs:
                     raise CompilationError(
-                        f"Recursion failed after {attempt + 1} attempt(s): {e}",
+                        f"{sig.qualname} failed after {attempt + 1} attempt(s): {e}",
                         signature=sig,
                         attempts=attempts,
                     ) from e
-                # Build a repair context and compile a revised body.
-                self.tracer.emit(TraceEvent("repair", sig.qualname, {"attempt": attempt + 1}))
-                current_entry = await self._repair(
-                    sig=sig,
-                    surface=surface,
-                    inputs=inputs,
-                    prior_entry=current_entry,
-                    exception=e,
-                    trace_frames=trace_frames,
-                    prior_attempts=attempt,
-                )
+                champion = await self._descend(fn, surface, inputs, champion)
                 continue
             else:
                 elapsed = (time.perf_counter() - t0) * 1000
                 self.archive.record_metrics(
                     sig.signature_hash,
-                    surface.tool_surface_hash,
-                    current_entry.version,
+                    surface.surface_hash,
+                    champion.version,
                     success=True,
                     latency_ms=elapsed,
                 )
                 self.tracer.emit(
-                    TraceEvent("call_end", sig.qualname, {"mode": "recursion", "ok": True})
+                    TraceEvent("call_end", sig.qualname, {"mode": fn.mode, "ok": True})
                 )
                 return value
 
@@ -335,103 +297,307 @@ class Runtime:
             attempts=attempts,
         )
 
-    async def _compile_and_archive(
-        self,
-        sig: CallSignature,
-        surface: ToolSurface,
-        inputs: dict[str, Any],
-        overrides: _Overrides,
-    ) -> ArchiveEntry:
-        compiler = Compiler(overrides.model) if overrides.model is not None else self._compiler
-        neighbors = tuple(e.body for e in self.archive.neighbors(sig.signature_hash, k=3))
-        ctx = JITContext(
-            signature=sig,
+    async def _execute_native(self, fn: Fn, inputs: dict[str, Any]) -> Any:
+        """Run the handwritten seed as ordinary Python — it is trusted code."""
+        result = fn._original(**inputs)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
+
+    # ------------------------------------------------------------------
+    # Variation: genesis, descent, gradient steps
+    # ------------------------------------------------------------------
+
+    async def _genesis(self, fn: Fn, surface: ToolSurface, inputs: dict[str, Any]) -> Variant:
+        """First variant of a lineage: register the seed, or spawn a body."""
+        if fn.mode == "solid":
+            seed = GeneratedBody(
+                reasoning="Handwritten seed — generation zero of this lineage.",
+                imports=[],
+                body=fn._seed_source or "",
+            )
+            return self._insert(fn.signature, surface, seed, operator="seed", parents=())
+        variation = Variation(
+            signature=fn.signature,
             surface=surface,
             inputs=inputs,
-            archive_neighbors=neighbors,
-            remaining_depth=self.budget.max_recursion_depth,
+            neighbors=self._neighbors(fn.signature),
             budget=self.budget,
         )
-        body = await compiler.compile(ctx)
-        version = self.archive.next_version(sig.signature_hash, surface.tool_surface_hash)
-        entry = ArchiveEntry(
-            signature_hash=sig.signature_hash,
-            tool_surface_hash=surface.tool_surface_hash,
-            version=version,
-            parent_version=None,
-            body=body,
-            created_at=now_utc(),
-            trigger="initial",
-            promoted=True,
-        )
-        self.archive.insert(entry)
-        self.archive.promote(sig.signature_hash, surface.tool_surface_hash, version)
-        return entry
+        body = await self._compiler_for(fn).vary(variation)
+        return self._insert(fn.signature, surface, body, operator="spawn", parents=())
 
-    async def _repair(
-        self,
-        *,
-        sig: CallSignature,
-        surface: ToolSurface,
-        inputs: dict[str, Any],
-        prior_entry: ArchiveEntry,
-        exception: BaseException,
-        trace_frames: list[TraceFrame],
-        prior_attempts: int,
-    ) -> ArchiveEntry:
-        repair_input = RepairInput(
-            prior_body=prior_entry.body,
-            exception=exception,
-            trace_frames=trace_frames,
-            attempts_so_far=prior_attempts,
+    async def _descend(
+        self, fn: Fn, surface: ToolSurface, inputs: dict[str, Any], parent: Variant
+    ) -> Variant:
+        """Mutate a failing champion under everything recorded against it."""
+        signals = self.archive.signals_for(
+            fn.signature.signature_hash, surface.surface_hash, parent.version
         )
-        base_ctx = JITContext(
-            signature=sig,
+        variation = Variation(
+            signature=fn.signature,
             surface=surface,
             inputs=inputs,
-            archive_neighbors=tuple(
-                e.body for e in self.archive.neighbors(sig.signature_hash, k=3)
-            ),
-            remaining_depth=self.budget.max_recursion_depth,
+            parents=(parent.body,),
+            signals=tuple(signals),
+            neighbors=self._neighbors(fn.signature),
             budget=self.budget,
         )
-        repaired_ctx = build_repair_ctx(base_ctx, repair_input)
-        revised_body = await self._compiler.compile(repaired_ctx)
+        body = await self._compiler_for(fn).vary(variation)
+        return self._insert(
+            fn.signature, surface, body, operator="mutate", parents=(parent.version,)
+        )
 
-        # Shadow validation: re-run against the failing inputs (at minimum).
-        if self.shadow_validate:
+    async def _backward(self, fn: Fn) -> Variant:
+        """A textual gradient step: mutate under accumulated (soft) signals."""
+        surface = await self._ensure_surface()
+        sig = fn.signature
+        champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
+        if champion is None:
+            raise FrameworkError(f"{sig.qualname} has no champion yet — call it once first.")
+        signals = self.archive.signals_for(
+            sig.signature_hash, surface.surface_hash, champion.version
+        )
+        if not signals:
+            raise FrameworkError(
+                f"{sig.qualname} has no signals against its champion — "
+                f"record feedback() before backward()."
+            )
+        self.tracer.emit(
+            TraceEvent(
+                "backward", sig.qualname, {"signals": len(signals), "version": champion.version}
+            )
+        )
+        variation = Variation(
+            signature=sig,
+            surface=surface,
+            inputs=fn._last_inputs or {},
+            parents=(champion.body,),
+            signals=tuple(signals),
+            neighbors=self._neighbors(sig),
+            budget=self.budget,
+        )
+        body = await self._compiler_for(fn).vary(variation)
+
+        if self.shadow_validate and fn._last_inputs is not None:
             try:
-                external_fns = self._build_external_functions(
-                    surface, [], depth=0, overrides=_Overrides()
-                )
                 raw = await self.sandbox.execute(
-                    body=revised_body,
+                    body=body,
                     signature=sig,
                     surface=surface,
-                    inputs=inputs,
-                    external_functions=external_fns,
+                    inputs=fn._last_inputs,
+                    external_functions=self._build_external_functions(surface, []),
                 )
                 _validate_return(sig, raw)
             except Exception as e:
                 raise CompilationError(
-                    f"Revised body failed shadow validation: {e}",
-                    signature=sig,
+                    f"Gradient step failed shadow validation: {e}", signature=sig
                 ) from e
 
-        version = self.archive.next_version(sig.signature_hash, surface.tool_surface_hash)
-        entry = ArchiveEntry(
-            signature_hash=sig.signature_hash,
-            tool_surface_hash=surface.tool_surface_hash,
-            version=version,
-            parent_version=prior_entry.version,
-            body=revised_body,
-            created_at=now_utc(),
-            trigger="repair",
-            promoted=True,
+        return self._insert(sig, surface, body, operator="mutate", parents=(champion.version,))
+
+    # ------------------------------------------------------------------
+    # Offline evolution
+    # ------------------------------------------------------------------
+
+    async def _evolve(
+        self,
+        fn: Fn,
+        examples: list[dict[str, Any]],
+        *,
+        generations: int,
+        population: int,
+        score: Callable[[dict[str, Any], Any], float] | None,
+        promote: bool,
+    ) -> EvolutionReport:
+        surface = await self._ensure_surface()
+        sig = fn.signature
+
+        champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
+        if champion is None:
+            champion = await self._genesis(fn, surface, examples[0] if examples else {})
+
+        pool: dict[int, tuple[Variant, float]] = {}
+        fitness = await self._evaluate(fn, surface, champion, examples, score)
+        self.archive.set_fitness(
+            sig.signature_hash, surface.surface_hash, champion.version, fitness
         )
-        self.archive.insert(entry)
-        self.archive.promote(sig.signature_hash, surface.tool_surface_hash, version)
-        return entry
+        pool[champion.version] = (champion, fitness)
+
+        for gen in range(generations):
+            ranked = sorted(pool.values(), key=lambda vf: vf[1], reverse=True)
+            top1 = ranked[0][0]
+            top2 = ranked[1][0] if len(ranked) > 1 else None
+            for i in range(population):
+                operator, parents = self._pick_operator(i, top1, top2)
+                signals = (
+                    tuple(
+                        self.archive.signals_for(
+                            sig.signature_hash, surface.surface_hash, parents[0].version
+                        )
+                    )
+                    if operator == "mutate"
+                    else ()
+                )
+                variation = Variation(
+                    signature=sig,
+                    surface=surface,
+                    inputs=examples[i % len(examples)] if examples else {},
+                    parents=tuple(p.body for p in parents),
+                    signals=signals,
+                    neighbors=self._neighbors(sig),
+                    budget=self.budget,
+                )
+                try:
+                    body = await self._compiler_for(fn).vary(variation)
+                except Exception as e:
+                    self.tracer.emit(
+                        TraceEvent(
+                            "evolve",
+                            sig.qualname,
+                            {"gen": gen, "operator": operator, "error": type(e).__name__},
+                        )
+                    )
+                    continue
+                offspring = self._insert(
+                    sig,
+                    surface,
+                    body,
+                    operator=operator,
+                    parents=tuple(p.version for p in parents),
+                    promoted=False,
+                )
+                fitness = await self._evaluate(fn, surface, offspring, examples, score)
+                offspring.fitness = fitness
+                self.archive.set_fitness(
+                    sig.signature_hash, surface.surface_hash, offspring.version, fitness
+                )
+                pool[offspring.version] = (offspring, fitness)
+                self.tracer.emit(
+                    TraceEvent(
+                        "evolve",
+                        sig.qualname,
+                        {
+                            "gen": gen,
+                            "operator": operator,
+                            "version": offspring.version,
+                            "fitness": round(fitness, 3),
+                        },
+                    )
+                )
+
+        best, best_fitness = max(pool.values(), key=lambda vf: (vf[1], vf[0].version))
+        if promote:
+            self.archive.promote(sig.signature_hash, surface.surface_hash, best.version)
+            best.promoted = True
+            self.tracer.emit(
+                TraceEvent(
+                    "promote",
+                    sig.qualname,
+                    {"version": best.version, "fitness": round(best_fitness, 3)},
+                )
+            )
+        return EvolutionReport(
+            champion=best,
+            evaluated=sorted(pool.values(), key=lambda vf: vf[0].version),
+            generations=generations,
+        )
+
+    @staticmethod
+    def _pick_operator(
+        i: int, top1: Variant, top2: Variant | None
+    ) -> tuple[Operator, tuple[Variant, ...]]:
+        """Round-robin the operators: mutate the best, cross the top two, spawn fresh."""
+        cycle: list[tuple[Operator, tuple[Variant, ...]]] = [("mutate", (top1,))]
+        if top2 is not None:
+            cycle.append(("cross", (top1, top2)))
+        cycle.append(("spawn", ()))
+        return cycle[i % len(cycle)]
+
+    async def _evaluate(
+        self,
+        fn: Fn,
+        surface: ToolSurface,
+        variant: Variant,
+        examples: list[dict[str, Any]],
+        score: Callable[[dict[str, Any], Any], float] | None,
+    ) -> float:
+        """Fitness of a variant over the examples: validated success x score."""
+        if not examples:
+            return 0.5
+        total = 0.0
+        for inputs in examples:
+            try:
+                if variant.operator == "seed":
+                    raw = await self._execute_native(fn, inputs)
+                else:
+                    raw = await self.sandbox.execute(
+                        body=variant.body,
+                        signature=fn.signature,
+                        surface=surface,
+                        inputs=inputs,
+                        external_functions=self._build_external_functions(surface, []),
+                    )
+                value = _validate_return(fn.signature, raw)
+            except Exception:
+                continue
+            total += score(inputs, value) if score is not None else 1.0
+        return total / len(examples)
+
+    # ------------------------------------------------------------------
+    # Archive and signal plumbing
+    # ------------------------------------------------------------------
+
+    def _insert(
+        self,
+        sig: CallSignature,
+        surface: ToolSurface,
+        body: GeneratedBody,
+        *,
+        operator: Operator,
+        parents: tuple[int, ...],
+        promoted: bool = True,
+    ) -> Variant:
+        version = self.archive.next_version(sig.signature_hash, surface.surface_hash)
+        variant = Variant(
+            signature_hash=sig.signature_hash,
+            surface_hash=surface.surface_hash,
+            version=version,
+            operator=operator,
+            parents=parents,
+            body=body,
+            created_at=now_utc(),
+            promoted=promoted,
+        )
+        self.archive.insert(variant)
+        if promoted:
+            self.archive.promote(sig.signature_hash, surface.surface_hash, version)
+        self.tracer.emit(
+            TraceEvent(
+                "vary",
+                sig.qualname,
+                {"operator": operator, "version": version, "parents": list(parents)},
+            )
+        )
+        return variant
+
+    def _record_signal(self, fn: Fn, champion: Variant, signal: Signal) -> None:
+        self.archive.record_signal(
+            fn.signature.signature_hash, champion.surface_hash, champion.version, signal
+        )
+        self.tracer.emit(
+            TraceEvent(
+                "signal",
+                fn.signature.qualname,
+                {"kind": signal.kind, "weight": signal.weight, "version": champion.version},
+            )
+        )
+
+    def _compiler_for(self, fn: Fn) -> Compiler:
+        return Compiler(fn._model) if fn._model is not None else self._compiler
+
+    def _neighbors(self, sig: CallSignature) -> tuple[GeneratedBody, ...]:
+        return tuple(v.body for v in self.archive.neighbors(sig.signature_hash, k=3))
 
     # ------------------------------------------------------------------
     # Tool dispatch
@@ -441,9 +607,6 @@ class Runtime:
         self,
         surface: ToolSurface,
         trace_frames: list[TraceFrame],
-        *,
-        depth: int,
-        overrides: _Overrides,
     ) -> dict[str, Callable[..., Awaitable[Any]]]:
         tool_calls = _Counter()
 
@@ -474,13 +637,7 @@ class Runtime:
 
             return invoke
 
-        functions: dict[str, Callable[..., Awaitable[Any]]] = {
-            t.name: wrap_mcp(t) for t in surface.tools if t.source == "mcp"
-        }
-        # Inline helpers added after initial compile, if any body declared them.
-        # (Rare in POC; usually resolved via the build-time surface expansion
-        # done by the recursion pipeline when it processes body.helpers.)
-        return functions
+        return {t.name: wrap_mcp(t) for t in surface.tools if t.source == "mcp"}
 
     # ------------------------------------------------------------------
     # Tool-surface bootstrap
@@ -494,26 +651,29 @@ class Runtime:
                 if self._mcp_clients:
                     self._surface = await build_mcp_surface(self._mcp_clients)
                 else:
-                    self._surface = ToolSurface(tools=(), tool_surface_hash="empty")
+                    self._surface = ToolSurface(tools=(), surface_hash="empty")
         return self._surface
+
+    def _surface_hash_now(self) -> str:
+        """Surface hash for sync reflection paths (champion, lineage, feedback)."""
+        if self._surface is not None:
+            return self._surface.surface_hash
+        if not self._mcp_clients:
+            self._surface = ToolSurface(tools=(), surface_hash="empty")
+            return self._surface.surface_hash
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._ensure_surface()).surface_hash
+        raise FrameworkError(
+            "Tool surface not built yet and we're inside an event loop — "
+            "call the function once (or await it) before reflecting on it."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class _Overrides:
-    def __init__(
-        self,
-        *,
-        model: Model | None = None,
-        max_repair_attempts: int | None = None,
-        archive_key: str | None = None,
-    ) -> None:
-        self.model = model
-        self.max_repair_attempts = max_repair_attempts
-        self.archive_key = archive_key
 
 
 class _Counter:
@@ -526,45 +686,10 @@ class _Counter:
         self.value += 1
 
 
-def _bind_inputs(
-    fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> dict[str, Any]:
-    sig = inspect.signature(fn)
-    bound = sig.bind(*args, **kwargs)
-    bound.apply_defaults()
-    return dict(bound.arguments)
-
-
-def _wrap_callable(
-    original: Callable[..., Any], invoke_async: Callable[..., Awaitable[Any]]
-) -> Callable[..., Any]:
-    """Create a sync-friendly wrapper that also works inside async code.
-
-    The wrapper returns a value when called from a sync context, and an
-    awaitable when called from an async context (via loop detection).
-    """
-    is_source_async = inspect.iscoroutinefunction(original)
-
-    @functools.wraps(original)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop — we can block with asyncio.run.
-            return asyncio.run(invoke_async(*args, **kwargs))
-        # Running loop exists — return a coroutine for the caller to await.
-        return invoke_async(*args, **kwargs)
-
-    # If the original was defined `async def`, preserve that marker so callers
-    # that use `inspect.iscoroutinefunction` still see it as such.
-    if is_source_async:
-        wrapper = functools.wraps(original)(invoke_async)  # type: ignore[assignment]
-
-    return wrapper
-
-
 def _validate_return(sig: CallSignature, value: Any) -> Any:
-    if sig.return_type is Any or sig.return_type is inspect.Parameter.empty:
+    import inspect as _inspect
+
+    if sig.return_type is Any or sig.return_type is _inspect.Parameter.empty:
         return value
     try:
         adapter = TypeAdapter(sig.return_type)
@@ -579,12 +704,10 @@ def _validate_return(sig: CallSignature, value: Any) -> Any:
 
 def _unwrap_mcp_result(result: Any) -> Any:
     """FastMCP's call_tool returns a structured object; we want the payload."""
-    # FastMCP >= 3 returns CallToolResult with .structured_content / .data / .content.
     for attr in ("data", "structured_content", "content"):
         if hasattr(result, attr):
             v = getattr(result, attr)
             if v is not None:
-                # MCP content is typically a list of TextContent; normalize.
                 if isinstance(v, list) and v and hasattr(v[0], "text"):
                     return "\n".join(getattr(c, "text", str(c)) for c in v)
                 return v

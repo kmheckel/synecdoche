@@ -26,7 +26,7 @@ def test_tool_spec_renders_async_stub_with_types() -> None:
     assert "Read a file." in stub
 
 
-def test_tool_surface_hash_is_stable() -> None:
+def test_surface_hash_is_stable() -> None:
     t1 = ToolSpec(
         name="a",
         description="",
@@ -47,10 +47,10 @@ def test_tool_surface_hash_is_stable() -> None:
 
 
 def test_with_inline_helpers_preserves_surface_hash() -> None:
-    base = ToolSurface(tools=(), tool_surface_hash="abc")
+    base = ToolSurface(tools=(), surface_hash="abc")
     helper = ToolSpec(
         name="h", description="", params_schema={}, return_schema={}, source="inline_helper"
     )
     with_h = base.with_inline_helpers([helper])
-    assert with_h.tool_surface_hash == "abc"
+    assert with_h.surface_hash == "abc"
     assert with_h.by_name("h") is helper

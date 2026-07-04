@@ -1,9 +1,11 @@
-"""Full @rt.recursion example — LLM compiles a body that calls an MCP server.
+"""Synthesis example — the model compiles a body that calls an MCP server.
 
-This mirrors the design spec's canonical example: the model writes a
-`solve` body that reads files through a FastMCP filesystem server and
-assembles a typed `Summary` of the target codebase. The body is archived
-after the first successful call; subsequent runs hit the cache.
+The contract below has no body, so the runtime spawns one at first call:
+the model writes a `solve` body that reads files through a FastMCP
+filesystem server and assembles a typed `Summary`. The body joins the
+archive as that signature's champion; subsequent runs skip compilation.
+If it ever raises, the exception becomes a hard signal and the champion
+is mutated into a descendant that fixes the defect.
 
 Prerequisites:
 
@@ -40,8 +42,8 @@ class Summary(BaseModel):
 
 
 rt = Runtime(
-    model_recursion=AnthropicModel("claude-opus-4-7"),
-    model_infer=AnthropicModel("claude-haiku-4-5"),
+    model_code=AnthropicModel("claude-opus-4-7"),
+    model_oracle=AnthropicModel("claude-haiku-4-5"),
     mcp=[Client("stdio://mcp-server-filesystem")],
     archive="./.archive",
     heal=True,
@@ -49,7 +51,7 @@ rt = Runtime(
 )
 
 
-@rt.recursion
+@rt.fn
 def summarize_codebase(root: Path) -> Summary:
     """Summarize the architecture of a codebase at the given root.
 
@@ -64,3 +66,8 @@ if __name__ == "__main__":
     target = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     result = summarize_codebase(target)
     print(result.model_dump_json(indent=2))
+
+    # Reflection: the function is an object you can interrogate.
+    champ = summarize_codebase.champion
+    print(f"\n# champion: v{champ.version} ({champ.operator}), score {champ.score():.2f}")
+    print("# solidify() would render it back into committable source.")

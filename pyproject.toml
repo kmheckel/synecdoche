@@ -1,7 +1,7 @@
 [project]
 name = "synecdoche"
-version = "0.1.0"
-description = "JIT AI code synthesis and execution — a functional paradigm for LLM-backed functions."
+version = "0.2.0"
+description = "Typed contracts, evolved implementations — code as a phase of matter, from handwritten to model-grown and back."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
@@ -17,6 +17,8 @@ keywords = [
     "mcp",
     "agents",
     "jit",
+    "evolutionary-programming",
+    "self-healing",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
