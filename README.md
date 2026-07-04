@@ -1,192 +1,237 @@
 # synecdoche
 
-**JIT AI code synthesis as a functional paradigm.**
-
-Write a typed Python function signature. Decorate it. At first call, an LLM
-compiles a body, runs it in a sandbox, archives the result, and self-heals
-from exceptions on the next run.
-
-No `Agent` classes. No ambient state. No conversation history. Just types
-and decorators.
+**One decorator. You write the spec; the runtime learns the code.**
 
 ```python
-from pydantic import BaseModel
+import synecdoche as syn
 from pydantic_ai.models.anthropic import AnthropicModel
-from synecdoche import Runtime
 
-class Sentiment(BaseModel):
-    label: str
-    confidence: float
+syn.configure(model=AnthropicModel("claude-sonnet-4-6"), archive="./.synecdoche")
 
-rt = Runtime(model=AnthropicModel("claude-sonnet-4-6"))
-
-@rt.infer
-def classify_sentiment(text: str) -> Sentiment:
-    """Classify sentiment as positive, negative, or neutral."""
-
-print(classify_sentiment("I love this!"))
-# label='positive' confidence=0.95
+@syn
+def dedupe(records: list[Record]) -> list[Record]:
+    """Merge records that refer to the same real-world entity."""
 ```
 
-## The idea
+First call: a body is generated to meet the spec, type-checked, run in a
+sandbox, validated against the return type, and cached. Every call after:
+the cached body runs. When it raises, the exception becomes the compile
+context for a fixed replacement — failure is selection pressure, not an
+error page. And the learned code is never hidden: the current champion for
+every function is mirrored to `./.synecdoche/champions/` as an ordinary
+`.py` file you can read, diff, and commit.
 
-Most agent frameworks are object-oriented at their core: you subclass an
-`Agent`, register `@tool`s on it, and thread state through `self`. The
-surface area of the framework grows with every new capability.
+## Heuristic learning
 
-synecdoche is the opposite bet: **one runtime, two decorators, types
-everywhere, MCP for effects, sandbox for execution, exceptions as the
-repair signal.**
+The design target is what Jiayi Weng's
+[Learning Beyond Gradients](https://trinkle23897.github.io/learning-beyond-gradients/)
+calls **heuristic learning**: the standard learning loop — state, action,
+feedback, update — where the object being updated is *program structure,
+not neural-network weights*. The model is the update channel; the program
+is the parameter; history stays explicit, readable, and refactorable
+instead of being compressed into a checkpoint.
+
+synecdoche makes that loop a language primitive, per function:
+
+| learning loop | synecdoche |
+|---|---|
+| parameters | the current body (the *champion*) for each `@syn` spec |
+| forward pass | calling the function |
+| loss signals | exceptions & validation failures (hard), `syn.feedback(f, score, note)` (soft) |
+| update step | `syn.descend(f)` — regenerate the body under its accumulated signals |
+| training loop | `syn.evolve(f, examples, score=...)` — generate, measure, select, repeat |
+| checkpoint | a readable `.py` file with provenance in the header |
+
+The same loop is what [FunSearch](https://deepmind.google/discover/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/)
+and its successors used to discover new bin-packing heuristics and
+mathematical constructions, and what LLM-driven
+[heuristic discovery](https://arxiv.org/html/2501.18784v2) does for
+planning: programs as hypotheses, an evaluator as fitness, selection over
+readable code — evolutionary programming and symbolic regression with a
+neural proposal distribution. `examples/heuristic_learning.py` (bin
+packing) and `examples/symbolic_regression.py` are exactly these
+experiments, each in under a hundred lines.
+
+## The decorator
+
+`@syn` accepts the full range between "I wrote the code" and "I wrote the
+intent":
+
+```python
+@syn                          # spec only: the body is generated at first call
+def choose_shard(key: str, load: dict[str, float]) -> str:
+    """Pick the shard for this key, balancing load against locality."""
+
+@syn                          # handwritten body: generation zero of a lineage
+def pack(items: list[float], capacity: float) -> list[int]:
+    """Assign every item to a bin; use as few bins as possible."""
+    ...your naive first-fit, for evolution to beat...
+```
+
+Both are the same object afterwards. A handwritten body runs natively, as
+written, with zero model involvement — until it raises, at which point the
+exception (with all its structured attributes) drives the generation of a
+sandboxed descendant that fixes the defect. The call site cannot tell the
+difference, and `syn.solidify(f)` renders any champion back into source
+you can paste under `@syn` to seed the next lineage.
+
+The cache key is `(signature, tool surface)`: change the types or the
+mounted tools and you get a fresh generation. Types are the contract —
+every return value is validated against the annotation, whoever wrote the
+body.
+
+## Recursion is controlled by construction
+
+Generated code cannot spawn more generated code. A body is flat: it may
+call the MCP tools you mounted and one builtin —
+
+```python
+await infer(instruction="is this address residential? yes/no", data=text)
+```
+
+— a single typed judgment call, for the sub-problems that are perception
+rather than algorithm. That's the entire nesting story. Composition of
+specs happens in *your* Python, where the call graph is visible, bounded,
+and reviewable:
+
+```python
+@syn
+def extract(doc: str) -> Claims: ...
+
+@syn
+def verify(claims: Claims) -> Report: ...
+
+def audit(doc: str) -> Report:      # plain Python — you own the structure
+    return verify(extract(doc))
+```
+
+No hidden agent trees, no runaway recursion, no depth budget you have to
+tune — the hierarchy is exactly what you wrote.
+
+## The cache is code, not a blob
+
+Every variant ever generated is archived in SQLite with its full lineage:
+which parent it was varied from, by which operator (`spawn` / `mutate` /
+`cross`), what signals were recorded against it, its live success metrics
+and measured fitness. On top of that, every *promoted* champion is
+mirrored to a source file:
 
 ```
-┌──────────────────┐
-│  @rt.infer       │  terminal — one structured-output call, returns typed value
-│  @rt.recursion   │  non-terminal — LLM emits a Python body, runs in a sandbox
-└──────────────────┘
+.synecdoche/
+├── synecdoche.sqlite          # lineage, metrics, signals — the fossil record
+└── champions/
+    └── pack_3f9a01bc.py       # the code that runs, readable and diffable
 ```
 
-Behind the decorators:
+```python
+# Champion for pack (signature 3f9a01bc...)
+# v3 (mutate <- v2) — promoted 2026-07-04T18:22:11+00:00
+# reasoning: Sort items descending and use best-fit; the v2 failure showed
+#   first-fit fragmenting bins on the large-item-late instances.
+# Regenerated by synecdoche on every promotion; do not edit in place.
+# To take ownership, move the body into your source under @syn.
+async def pack(items: list[float], capacity: float) -> list[int]:
+    ...
+```
 
-- [**pydantic-ai**](https://ai.pydantic.dev/) — provider-agnostic model
-  abstraction and structured output. Swap Anthropic for OpenAI, Gemini,
-  Ollama, or anything else it supports without touching synecdoche.
+Check the directory into git and every promotion shows up as a reviewable
+diff. This is the maintainability contract: what the system learned is
+always inspectable as ordinary source. (`syn.lineage(f)`, `syn.champion(f)`,
+`syn.signals(f)`, and `syn.rollback(f)` give you the same view from code.)
+
+## How is this different from just using a coding agent?
+
+A coding agent is a *session*: you ask for a function, it writes one, the
+session ends, and the feedback loop ends with it. synecdoche is the loop
+made permanent and attached to the call site:
+
+- **The spec is the durable artifact.** The implementation is disposable
+  and regenerable — against today's model, today's tool schemas, today's
+  types. A coding agent's output goes stale; a spec doesn't.
+- **Feedback arrives where the code runs.** Production exceptions, with
+  their structured payloads, land in the archive against the exact variant
+  that raised — not in a bug report a human relays into a chat window.
+- **Selection is continuous.** Metrics, signals, and fitness accumulate
+  per variant; champions are demoted and replaced on evidence, per
+  deployment context (the tool-surface hash), without anyone driving.
+- **And it degrades gracefully into the coding-agent workflow**: when a
+  champion is good, `solidify` it, commit it, own it. The decorator then
+  costs nothing but the safety net.
+
+The honest caveat: a coding agent sees your whole repo; a `@syn` body sees
+one signature, its tools, and its lineage. This is a bet on narrow scopes
+with tight feedback beating broad scopes with none — for leaf functions,
+heuristics, and glue, not for architecture.
+
+## The machinery
+
+```
+call ──> champion lookup ──> execute (native | sandbox) ──> validate ──> value
+             │ miss                      │ raise
+             ▼                           ▼
+         generate (spawn)          signal recorded
+                                   regenerate (mutate) ──> promote ──> retry
+```
+
+- [**pydantic-ai**](https://ai.pydantic.dev/) — provider-agnostic models
+  and structured output; swap providers without touching synecdoche.
 - [**FastMCP**](https://gofastmcp.com/) — the tool surface. Mount MCP
-  servers on the runtime and generated bodies call them uniformly. No
-  `@tool` decorator in synecdoche itself — tool definitions live where
-  they belong.
-- [**pydantic-monty**](https://pydantic.dev/articles/pydantic-monty) —
-  a sandboxed Python interpreter that yields at external calls so the
-  host can dispatch them.
+  servers; generated bodies call them uniformly; the surface hash is part
+  of the cache key, so a changed tool schema is a changed world.
+- [**pydantic-monty**](https://pydantic.dev/articles/pydantic-monty) — a
+  sandboxed Python interpreter that yields at external calls so the host
+  dispatches them. Generated code never touches your process, filesystem,
+  or network directly.
 
-## How it works
-
-When you call a `@rt.recursion` function for the first time:
-
-1. The runtime computes a `(signature_hash, tool_surface_hash)` key.
-2. Miss in archive → the compiler is invoked with the signature, return
-   type schema, tool surface, and inputs. It emits a structured
-   `GeneratedBody` containing the `solve` function source.
-3. The sandbox assembles imports + type stubs + the body, type-checks it,
-   and executes it. Every external call (MCP tool, inline helper) yields
-   out of Monty and is dispatched by the host.
-4. The return value is validated against the declared return type.
-5. On success: archived, promoted, returned.
-6. On failure: the exception (with its structured args) becomes the input
-   to a *repair* compilation. The revised body is shadow-validated
-   against the failing inputs before being promoted.
-
-Subsequent calls: cache hit. The archived body runs directly.
-
-## Installation
+## Install & configure
 
 ```bash
-uv add synecdoche
-# or
-pip install synecdoche
+uv add synecdoche          # or: pip install synecdoche
+uv add "synecdoche[anthropic]"   # provider extras: [openai], [all]
 ```
-
-For providers:
-
-```bash
-uv add "synecdoche[anthropic]"   # or [openai], [all]
-```
-
-## Usage
-
-### `@rt.infer` — terminal inference
-
-A single typed structured-output call. No sandbox, no archive.
 
 ```python
-@rt.infer
-def detect_language(text: str) -> Language:
-    """Identify the natural language of the given text."""
-```
-
-### `@rt.recursion` — compiled body
-
-The compiler synthesizes a body that may call MCP tools and inline
-`@ai.infer` / `@ai.recursion` helpers. The body is archived and reused.
-
-```python
-@rt.recursion
-def summarize_codebase(root: Path) -> Summary:
-    """Summarize the architecture of a codebase at the given root."""
-```
-
-### Per-call overrides
-
-```python
-@rt.infer(model=AnthropicModel("claude-opus-4-7"))
-def detect_subtle_bias(text: str) -> BiasReport: ...
-
-@rt.recursion(
+syn.configure(
     model=AnthropicModel("claude-sonnet-4-6"),
-    max_repair_attempts=4,
-)
-def list_recent_files(root: Path) -> list[Path]: ...
-```
+    # or split by role:
+    # model_code=AnthropicModel("claude-opus-4-7"),    # generates bodies
+    # model_infer=AnthropicModel("claude-haiku-4-5"),  # answers the infer builtin
 
-### Runtime configuration
-
-```python
-rt = Runtime(
-    # Either a single model…
-    model=AnthropicModel("claude-sonnet-4-6"),
-    # …or split by role:
-    # model_recursion=AnthropicModel("claude-opus-4-7"),
-    # model_infer=AnthropicModel("claude-haiku-4-5"),
-
-    mcp=[
-        Client("stdio://mcp-server-filesystem"),
-        Client("https://tools.example.com/mcp"),
-    ],
-
-    archive="./.archive",           # or path, or custom Archive impl
-    heal=True,
-    max_repair_attempts=2,
-    shadow_validate=True,
-    max_recursion_depth=6,
-    trace="stdout",                 # or a callable, or a Tracer instance
+    mcp=[Client("stdio://mcp-server-filesystem")],
+    archive="./.synecdoche",    # dir -> SQLite + champions/; omit -> in-memory
+    heal=True,                  # regenerate failing champions instead of raising
+    max_repairs=2,
+    shadow_validate=True,       # descend() validates before promoting
+    trace="stdout",
 )
 ```
 
-## Rich exceptions are the API
-
-The repair compiler is only as good as the information you give it. A raw
-`ValueError("something went wrong")` teaches it nothing. A structured
-exception carrying `{ "measured": 2_100_000, "limit": 200_000, "at_call":
-"derive_summary" }` teaches it exactly what to fix.
-
-Framework-defined exceptions the compiler learns to recognize:
-
-- `ContextWindowExceeded(measured, limit, at_call)`
-- `ToolSurfaceDrift(tool_name, expected_schema, actual_schema)`
-- `BudgetExceeded(kind, limit, measured)`
-
-Your own exceptions can carry anything — the more structure, the better
-the repair.
+Every function of the API also takes an explicit `backend=` (tests,
+multiple archives): `@syn(backend=be)`, and per-function overrides:
+`@syn(model=..., max_repairs=4)`.
 
 ## Status
 
-This is a **proof of concept** exploring what a functional, type-first
-alternative to OOP agent frameworks looks like. Expect the API to evolve.
+A **proof of concept** of heuristic learning as a language primitive.
+Expect the API to keep evolving — it would be embarrassing if it didn't.
 
-Milestones implemented:
+Implemented: the `@syn` decorator across handwritten and generated bodies
+with healing; flat-body sandbox execution with the `infer` builtin and MCP
+tools; the variation core (`spawn`/`mutate`/`cross`) with signals as the
+only compile context; SQLite + in-memory archives with lineage, metrics,
+signals, and champion mirroring to source files; `feedback`/`descend`;
+`evolve` with measured fitness; `vmap`; `solidify`.
 
-- [x] M1: Core compiler + sandbox loop.
-- [x] M2: SQLite archive + caching + tool-surface invalidation.
-- [x] M3: Exception-driven repair with shadow validation.
-- [ ] M4: Full observability (Logfire) and archive CLI.
-
-Deferred: soft-signal healing, offline optimization, semantic
-cross-signature search, distributed archives, MCP-server export of
-compiled functions.
+Deferred: island-model populations and novelty pressure for `evolve`,
+semantic neighbor search, editing mirrored champions back into the lineage,
+full observability (Logfire), archive CLI, MCP-server export of learned
+functions.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
 The `synecdoche` name has been on PyPI since 2023 (originally a JAX/Haiku
-hypernetwork experiment); this POC reuses it with the original author's
-permission for a rewrite under the same MIT terms.
+hypernetwork experiment); this project reuses it with the original
+author's permission for a rewrite under the same MIT terms. The name
+still fits: the part — a signature — stands for the whole.

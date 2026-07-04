@@ -1,33 +1,44 @@
-"""Archive: persistent record of compiled bodies, keyed by signature + tool surface.
+"""The archive: a population of variants under selection, keyed by signature.
 
-The archive is how calls after the first one skip compilation: lookup by
-`(signature_hash, tool_surface_hash)` gets you the current promoted body.
-Versions let repair insert a revised body as a successor while preserving
-the original for rollback.
+Every body the compiler has ever produced for a signature is a **variant** —
+a member of that signature's population, carrying its lineage (which parents
+it was varied from, by which operator), its live metrics, and the signals
+recorded against it. Exactly one variant per ``(signature, surface)`` key is
+*promoted*: the champion that runs on the next call.
 
-Two backends ship:
-- `MemoryArchive` — dict-backed, used in tests.
-- `SqliteArchive` — stdlib sqlite3, one file per project, suitable as the
-  default for local development.
+The archive is therefore three things at once:
+
+- a **cache** (champion lookup skips compilation),
+- a **fossil record** (every variant is kept; lineage is never rewritten),
+- a **gene pool** (evolution draws parents and cross-signature neighbors
+  from it).
+
+For maintainability the archive is not only a database: ``SqliteArchive``
+can mirror every promoted champion to a directory of ordinary ``.py``
+files — readable, diffable, greppable — so the learned code sits in your
+repo like any other source, with its provenance in the header. History
+stays explicit and refactorable instead of being buried in a blob.
+
+Two backends ship: ``MemoryArchive`` (dict-backed, for tests and ephemeral
+runs) and ``SqliteArchive`` (stdlib sqlite3, the default for local work).
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
-from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
 from .compiler import GeneratedBody
-
-Trigger = Literal["initial", "repair", "manual"]
+from .evolution import Operator, Signal, default_fitness, now_utc
 
 
 @dataclass
-class ArchiveMetrics:
+class Metrics:
     invocations: int = 0
     successes: int = 0
     exceptions: int = 0
@@ -36,38 +47,57 @@ class ArchiveMetrics:
 
 
 @dataclass
-class ArchiveEntry:
+class Variant:
+    """One member of a signature's population."""
+
     signature_hash: str
-    tool_surface_hash: str
+    surface_hash: str
     version: int
-    parent_version: int | None
+    operator: Operator
+    parents: tuple[int, ...]
     body: GeneratedBody
     created_at: datetime
-    trigger: Trigger
     promoted: bool = False
-    metrics: ArchiveMetrics = field(default_factory=ArchiveMetrics)
+    fitness: float | None = None  # measured (offline evolution); None = infer from metrics
+    metrics: Metrics = field(default_factory=Metrics)
+    qualname: str = ""  # human name of the spec, for the mirror and headers
+
+    def score(self, signals: list[Signal] | tuple[Signal, ...] = ()) -> float:
+        """Measured fitness if present, else inferred from live evidence."""
+        if self.fitness is not None:
+            return self.fitness
+        return default_fitness(
+            invocations=self.metrics.invocations,
+            successes=self.metrics.successes,
+            signals=signals,
+        )
 
 
 class Archive(Protocol):
-    def get_current(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None: ...
-    def get_version(
-        self, signature_hash: str, tool_surface_hash: str, version: int
-    ) -> ArchiveEntry | None: ...
-    def insert(self, entry: ArchiveEntry) -> None: ...
-    def promote(self, signature_hash: str, tool_surface_hash: str, version: int) -> None: ...
-    def rollback(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None: ...
-    def history(self, signature_hash: str, tool_surface_hash: str) -> list[ArchiveEntry]: ...
-    def neighbors(self, signature_hash: str, k: int = 3) -> list[ArchiveEntry]: ...
-    def next_version(self, signature_hash: str, tool_surface_hash: str) -> int: ...
+    def champion(self, signature_hash: str, surface_hash: str) -> Variant | None: ...
+    def get(self, signature_hash: str, surface_hash: str, version: int) -> Variant | None: ...
+    def insert(self, variant: Variant) -> None: ...
+    def promote(self, signature_hash: str, surface_hash: str, version: int) -> None: ...
+    def rollback(self, signature_hash: str, surface_hash: str) -> Variant | None: ...
+    def population(self, signature_hash: str, surface_hash: str) -> list[Variant]: ...
+    def neighbors(self, signature_hash: str, k: int = 3) -> list[Variant]: ...
+    def next_version(self, signature_hash: str, surface_hash: str) -> int: ...
     def record_metrics(
         self,
         signature_hash: str,
-        tool_surface_hash: str,
+        surface_hash: str,
         version: int,
         *,
         success: bool,
         latency_ms: float,
         validation_failure: bool = False,
+    ) -> None: ...
+    def record_signal(
+        self, signature_hash: str, surface_hash: str, version: int, signal: Signal
+    ) -> None: ...
+    def signals_for(self, signature_hash: str, surface_hash: str, version: int) -> list[Signal]: ...
+    def set_fitness(
+        self, signature_hash: str, surface_hash: str, version: int, fitness: float
     ) -> None: ...
 
 
@@ -80,79 +110,76 @@ class MemoryArchive:
     """Dict-backed Archive, suitable for tests and ephemeral runs."""
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str, int], ArchiveEntry] = {}
+        self._variants: dict[tuple[str, str, int], Variant] = {}
+        self._signals: dict[tuple[str, str, int], list[Signal]] = {}
         self._lock = threading.RLock()
 
-    def _key_entries(self, signature_hash: str, tool_surface_hash: str) -> list[ArchiveEntry]:
+    def _key_variants(self, signature_hash: str, surface_hash: str) -> list[Variant]:
         return sorted(
             [
-                e
-                for (sh, tsh, _), e in self._entries.items()
-                if sh == signature_hash and tsh == tool_surface_hash
+                v
+                for (sh, tsh, _), v in self._variants.items()
+                if sh == signature_hash and tsh == surface_hash
             ],
-            key=lambda e: e.version,
+            key=lambda v: v.version,
         )
 
-    def get_current(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None:
+    def champion(self, signature_hash: str, surface_hash: str) -> Variant | None:
         with self._lock:
-            promoted = [
-                e for e in self._key_entries(signature_hash, tool_surface_hash) if e.promoted
-            ]
+            promoted = [v for v in self._key_variants(signature_hash, surface_hash) if v.promoted]
             return promoted[-1] if promoted else None
 
-    def get_version(
-        self, signature_hash: str, tool_surface_hash: str, version: int
-    ) -> ArchiveEntry | None:
+    def get(self, signature_hash: str, surface_hash: str, version: int) -> Variant | None:
         with self._lock:
-            return self._entries.get((signature_hash, tool_surface_hash, version))
+            return self._variants.get((signature_hash, surface_hash, version))
 
-    def insert(self, entry: ArchiveEntry) -> None:
+    def insert(self, variant: Variant) -> None:
         with self._lock:
-            self._entries[(entry.signature_hash, entry.tool_surface_hash, entry.version)] = entry
+            key = (variant.signature_hash, variant.surface_hash, variant.version)
+            self._variants[key] = variant
 
-    def promote(self, signature_hash: str, tool_surface_hash: str, version: int) -> None:
+    def promote(self, signature_hash: str, surface_hash: str, version: int) -> None:
         with self._lock:
-            for e in self._key_entries(signature_hash, tool_surface_hash):
-                e.promoted = e.version == version
+            for v in self._key_variants(signature_hash, surface_hash):
+                v.promoted = v.version == version
 
-    def rollback(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None:
+    def rollback(self, signature_hash: str, surface_hash: str) -> Variant | None:
         with self._lock:
-            current = self.get_current(signature_hash, tool_surface_hash)
-            if current is None or current.parent_version is None:
+            current = self.champion(signature_hash, surface_hash)
+            if current is None or not current.parents:
                 return None
-            parent = self._entries.get((signature_hash, tool_surface_hash, current.parent_version))
+            parent = self._variants.get((signature_hash, surface_hash, current.parents[0]))
             if parent is None:
                 return None
-            for e in self._key_entries(signature_hash, tool_surface_hash):
-                e.promoted = e.version == parent.version
+            self.promote(signature_hash, surface_hash, parent.version)
             return parent
 
-    def history(self, signature_hash: str, tool_surface_hash: str) -> list[ArchiveEntry]:
+    def population(self, signature_hash: str, surface_hash: str) -> list[Variant]:
         with self._lock:
-            return list(self._key_entries(signature_hash, tool_surface_hash))
+            return list(self._key_variants(signature_hash, surface_hash))
 
-    def neighbors(self, signature_hash: str, k: int = 3) -> list[ArchiveEntry]:
-        # POC: no semantic similarity, just return k most-recent promoted entries
-        # across other signatures.
+    def neighbors(self, signature_hash: str, k: int = 3) -> list[Variant]:
+        # POC: no semantic similarity yet — the k most recent champions of
+        # other signatures, as style references for the compiler.
         with self._lock:
-            by_sig: dict[str, list[ArchiveEntry]] = {}
-            for e in self._entries.values():
-                if e.signature_hash == signature_hash or not e.promoted:
+            by_sig: dict[str, list[Variant]] = {}
+            for v in self._variants.values():
+                if v.signature_hash == signature_hash or not v.promoted:
                     continue
-                by_sig.setdefault(e.signature_hash, []).append(e)
-            candidates = [max(entries, key=lambda e: e.created_at) for entries in by_sig.values()]
-            candidates.sort(key=lambda e: e.created_at, reverse=True)
+                by_sig.setdefault(v.signature_hash, []).append(v)
+            candidates = [max(vs, key=lambda v: v.created_at) for vs in by_sig.values()]
+            candidates.sort(key=lambda v: v.created_at, reverse=True)
             return candidates[:k]
 
-    def next_version(self, signature_hash: str, tool_surface_hash: str) -> int:
+    def next_version(self, signature_hash: str, surface_hash: str) -> int:
         with self._lock:
-            existing = self._key_entries(signature_hash, tool_surface_hash)
+            existing = self._key_variants(signature_hash, surface_hash)
             return (existing[-1].version + 1) if existing else 1
 
     def record_metrics(
         self,
         signature_hash: str,
-        tool_surface_hash: str,
+        surface_hash: str,
         version: int,
         *,
         success: bool,
@@ -160,10 +187,10 @@ class MemoryArchive:
         validation_failure: bool = False,
     ) -> None:
         with self._lock:
-            entry = self._entries.get((signature_hash, tool_surface_hash, version))
-            if entry is None:
+            variant = self._variants.get((signature_hash, surface_hash, version))
+            if variant is None:
                 return
-            m = entry.metrics
+            m = variant.metrics
             m.invocations += 1
             if success:
                 m.successes += 1
@@ -173,6 +200,24 @@ class MemoryArchive:
                 m.validation_failures += 1
             m.avg_latency_ms = (m.avg_latency_ms * (m.invocations - 1) + latency_ms) / m.invocations
 
+    def record_signal(
+        self, signature_hash: str, surface_hash: str, version: int, signal: Signal
+    ) -> None:
+        with self._lock:
+            self._signals.setdefault((signature_hash, surface_hash, version), []).append(signal)
+
+    def signals_for(self, signature_hash: str, surface_hash: str, version: int) -> list[Signal]:
+        with self._lock:
+            return list(self._signals.get((signature_hash, surface_hash, version), []))
+
+    def set_fitness(
+        self, signature_hash: str, surface_hash: str, version: int, fitness: float
+    ) -> None:
+        with self._lock:
+            variant = self._variants.get((signature_hash, surface_hash, version))
+            if variant is not None:
+                variant.fitness = fitness
+
 
 # ---------------------------------------------------------------------------
 # SQLite backend
@@ -180,66 +225,92 @@ class MemoryArchive:
 
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS entries (
+CREATE TABLE IF NOT EXISTS variants (
     signature_hash      TEXT NOT NULL,
-    tool_surface_hash   TEXT NOT NULL,
+    surface_hash        TEXT NOT NULL,
     version             INTEGER NOT NULL,
-    parent_version      INTEGER,
+    operator            TEXT NOT NULL,
+    parents_json        TEXT NOT NULL DEFAULT '[]',
     body_json           TEXT NOT NULL,
     created_at          TEXT NOT NULL,
-    trigger             TEXT NOT NULL,
     promoted            INTEGER NOT NULL DEFAULT 0,
+    fitness             REAL,
+    qualname            TEXT NOT NULL DEFAULT '',
     invocations         INTEGER NOT NULL DEFAULT 0,
     successes           INTEGER NOT NULL DEFAULT 0,
     exceptions          INTEGER NOT NULL DEFAULT 0,
     validation_failures INTEGER NOT NULL DEFAULT 0,
     avg_latency_ms      REAL NOT NULL DEFAULT 0.0,
-    PRIMARY KEY (signature_hash, tool_surface_hash, version)
+    PRIMARY KEY (signature_hash, surface_hash, version)
 );
-CREATE INDEX IF NOT EXISTS idx_entries_key
-    ON entries(signature_hash, tool_surface_hash, promoted);
-CREATE INDEX IF NOT EXISTS idx_entries_sig
-    ON entries(signature_hash, promoted);
+CREATE INDEX IF NOT EXISTS idx_variants_key
+    ON variants(signature_hash, surface_hash, promoted);
+CREATE INDEX IF NOT EXISTS idx_variants_sig
+    ON variants(signature_hash, promoted);
+
+CREATE TABLE IF NOT EXISTS signals (
+    signature_hash      TEXT NOT NULL,
+    surface_hash        TEXT NOT NULL,
+    version             INTEGER NOT NULL,
+    kind                TEXT NOT NULL,
+    content             TEXT NOT NULL,
+    weight              REAL NOT NULL,
+    data_json           TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_key
+    ON signals(signature_hash, surface_hash, version);
 """
+
+_VARIANT_COLS = (
+    "signature_hash, surface_hash, version, operator, parents_json, body_json, "
+    "created_at, promoted, fitness, qualname, invocations, successes, exceptions, "
+    "validation_failures, avg_latency_ms"
+)
 
 
 class SqliteArchive:
     """SQLite-backed Archive. Thread-safe via a single connection + lock."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, mirror_dir: str | Path | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.mirror_dir = Path(mirror_dir) if mirror_dir is not None else None
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
-    def _row_to_entry(self, row: sqlite3.Row | tuple) -> ArchiveEntry:
+    def _row_to_variant(self, row: tuple) -> Variant:
         (
             sh,
             tsh,
             version,
-            parent,
+            operator,
+            parents_json,
             body_json,
             created_at,
-            trigger,
             promoted,
+            fitness,
+            qualname,
             inv,
             suc,
             exc,
             vf,
             lat,
         ) = row
-        return ArchiveEntry(
+        return Variant(
             signature_hash=sh,
-            tool_surface_hash=tsh,
+            surface_hash=tsh,
             version=version,
-            parent_version=parent,
+            operator=operator,
+            parents=tuple(json.loads(parents_json)),
             body=GeneratedBody.model_validate_json(body_json),
             created_at=datetime.fromisoformat(created_at),
-            trigger=trigger,
             promoted=bool(promoted),
-            metrics=ArchiveMetrics(
+            fitness=fitness,
+            qualname=qualname,
+            metrics=Metrics(
                 invocations=inv,
                 successes=suc,
                 exceptions=exc,
@@ -248,114 +319,104 @@ class SqliteArchive:
             ),
         )
 
-    def _select_where(self, where: str, params: Iterable) -> list[ArchiveEntry]:
+    def _select_where(self, where: str, params: tuple) -> list[Variant]:
         cur = self._conn.execute(
-            f"""
-            SELECT signature_hash, tool_surface_hash, version, parent_version,
-                   body_json, created_at, trigger, promoted,
-                   invocations, successes, exceptions, validation_failures,
-                   avg_latency_ms
-            FROM entries WHERE {where}
-            ORDER BY version ASC
-            """,
-            tuple(params),
+            f"SELECT {_VARIANT_COLS} FROM variants WHERE {where} ORDER BY version ASC",
+            params,
         )
-        return [self._row_to_entry(r) for r in cur.fetchall()]
+        return [self._row_to_variant(r) for r in cur.fetchall()]
 
-    def get_current(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None:
+    def champion(self, signature_hash: str, surface_hash: str) -> Variant | None:
         with self._lock:
-            entries = self._select_where(
-                "signature_hash = ? AND tool_surface_hash = ? AND promoted = 1",
-                (signature_hash, tool_surface_hash),
+            variants = self._select_where(
+                "signature_hash = ? AND surface_hash = ? AND promoted = 1",
+                (signature_hash, surface_hash),
             )
-            return entries[-1] if entries else None
+            return variants[-1] if variants else None
 
-    def get_version(
-        self, signature_hash: str, tool_surface_hash: str, version: int
-    ) -> ArchiveEntry | None:
+    def get(self, signature_hash: str, surface_hash: str, version: int) -> Variant | None:
         with self._lock:
-            entries = self._select_where(
-                "signature_hash = ? AND tool_surface_hash = ? AND version = ?",
-                (signature_hash, tool_surface_hash, version),
+            variants = self._select_where(
+                "signature_hash = ? AND surface_hash = ? AND version = ?",
+                (signature_hash, surface_hash, version),
             )
-            return entries[0] if entries else None
+            return variants[0] if variants else None
 
-    def insert(self, entry: ArchiveEntry) -> None:
+    def insert(self, variant: Variant) -> None:
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO entries (
-                    signature_hash, tool_surface_hash, version, parent_version,
-                    body_json, created_at, trigger, promoted,
-                    invocations, successes, exceptions, validation_failures,
-                    avg_latency_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                f"INSERT INTO variants ({_VARIANT_COLS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    entry.signature_hash,
-                    entry.tool_surface_hash,
-                    entry.version,
-                    entry.parent_version,
-                    entry.body.model_dump_json(),
-                    entry.created_at.isoformat(),
-                    entry.trigger,
-                    int(entry.promoted),
-                    entry.metrics.invocations,
-                    entry.metrics.successes,
-                    entry.metrics.exceptions,
-                    entry.metrics.validation_failures,
-                    entry.metrics.avg_latency_ms,
+                    variant.signature_hash,
+                    variant.surface_hash,
+                    variant.version,
+                    variant.operator,
+                    json.dumps(list(variant.parents)),
+                    variant.body.model_dump_json(),
+                    variant.created_at.isoformat(),
+                    int(variant.promoted),
+                    variant.fitness,
+                    variant.qualname,
+                    variant.metrics.invocations,
+                    variant.metrics.successes,
+                    variant.metrics.exceptions,
+                    variant.metrics.validation_failures,
+                    variant.metrics.avg_latency_ms,
                 ),
             )
             self._conn.commit()
 
-    def promote(self, signature_hash: str, tool_surface_hash: str, version: int) -> None:
+    def promote(self, signature_hash: str, surface_hash: str, version: int) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE entries SET promoted = 0 WHERE signature_hash = ? AND tool_surface_hash = ?",
-                (signature_hash, tool_surface_hash),
+                "UPDATE variants SET promoted = 0 WHERE signature_hash = ? AND surface_hash = ?",
+                (signature_hash, surface_hash),
             )
             self._conn.execute(
-                "UPDATE entries SET promoted = 1 WHERE signature_hash = ? AND tool_surface_hash = ? AND version = ?",
-                (signature_hash, tool_surface_hash, version),
+                "UPDATE variants SET promoted = 1 "
+                "WHERE signature_hash = ? AND surface_hash = ? AND version = ?",
+                (signature_hash, surface_hash, version),
             )
             self._conn.commit()
+        self._mirror(signature_hash, surface_hash, version)
 
-    def rollback(self, signature_hash: str, tool_surface_hash: str) -> ArchiveEntry | None:
-        current = self.get_current(signature_hash, tool_surface_hash)
-        if current is None or current.parent_version is None:
+    def rollback(self, signature_hash: str, surface_hash: str) -> Variant | None:
+        current = self.champion(signature_hash, surface_hash)
+        if current is None or not current.parents:
             return None
-        parent = self.get_version(signature_hash, tool_surface_hash, current.parent_version)
+        parent = self.get(signature_hash, surface_hash, current.parents[0])
         if parent is None:
             return None
-        self.promote(signature_hash, tool_surface_hash, parent.version)
+        self.promote(signature_hash, surface_hash, parent.version)
         return parent
 
-    def history(self, signature_hash: str, tool_surface_hash: str) -> list[ArchiveEntry]:
+    def population(self, signature_hash: str, surface_hash: str) -> list[Variant]:
         with self._lock:
             return self._select_where(
-                "signature_hash = ? AND tool_surface_hash = ?",
-                (signature_hash, tool_surface_hash),
+                "signature_hash = ? AND surface_hash = ?",
+                (signature_hash, surface_hash),
             )
 
-    def neighbors(self, signature_hash: str, k: int = 3) -> list[ArchiveEntry]:
+    def neighbors(self, signature_hash: str, k: int = 3) -> list[Variant]:
         with self._lock:
-            entries = self._select_where("signature_hash != ? AND promoted = 1", (signature_hash,))
-            entries.sort(key=lambda e: e.created_at, reverse=True)
-            return entries[:k]
+            variants = self._select_where("signature_hash != ? AND promoted = 1", (signature_hash,))
+            variants.sort(key=lambda v: v.created_at, reverse=True)
+            return variants[:k]
 
-    def next_version(self, signature_hash: str, tool_surface_hash: str) -> int:
+    def next_version(self, signature_hash: str, surface_hash: str) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "SELECT COALESCE(MAX(version), 0) FROM entries WHERE signature_hash = ? AND tool_surface_hash = ?",
-                (signature_hash, tool_surface_hash),
+                "SELECT COALESCE(MAX(version), 0) FROM variants "
+                "WHERE signature_hash = ? AND surface_hash = ?",
+                (signature_hash, surface_hash),
             )
             return cur.fetchone()[0] + 1
 
     def record_metrics(
         self,
         signature_hash: str,
-        tool_surface_hash: str,
+        surface_hash: str,
         version: int,
         *,
         success: bool,
@@ -364,9 +425,9 @@ class SqliteArchive:
     ) -> None:
         with self._lock:
             cur = self._conn.execute(
-                "SELECT invocations, avg_latency_ms FROM entries "
-                "WHERE signature_hash = ? AND tool_surface_hash = ? AND version = ?",
-                (signature_hash, tool_surface_hash, version),
+                "SELECT invocations, avg_latency_ms FROM variants "
+                "WHERE signature_hash = ? AND surface_hash = ? AND version = ?",
+                (signature_hash, surface_hash, version),
             )
             row = cur.fetchone()
             if row is None:
@@ -376,11 +437,11 @@ class SqliteArchive:
             new_avg = (avg * inv + latency_ms) / new_inv
             self._conn.execute(
                 """
-                UPDATE entries
+                UPDATE variants
                 SET invocations = ?, avg_latency_ms = ?,
                     successes = successes + ?, exceptions = exceptions + ?,
                     validation_failures = validation_failures + ?
-                WHERE signature_hash = ? AND tool_surface_hash = ? AND version = ?
+                WHERE signature_hash = ? AND surface_hash = ? AND version = ?
                 """,
                 (
                     new_inv,
@@ -389,11 +450,104 @@ class SqliteArchive:
                     0 if success else 1,
                     1 if validation_failure else 0,
                     signature_hash,
-                    tool_surface_hash,
+                    surface_hash,
                     version,
                 ),
             )
             self._conn.commit()
+
+    def record_signal(
+        self, signature_hash: str, surface_hash: str, version: int, signal: Signal
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO signals (signature_hash, surface_hash, version, kind, "
+                "content, weight, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    signature_hash,
+                    surface_hash,
+                    version,
+                    signal.kind,
+                    signal.content,
+                    signal.weight,
+                    json.dumps(signal.data, default=str),
+                    signal.created_at.isoformat(),
+                ),
+            )
+            self._conn.commit()
+
+    def signals_for(self, signature_hash: str, surface_hash: str, version: int) -> list[Signal]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT kind, content, weight, data_json, created_at FROM signals "
+                "WHERE signature_hash = ? AND surface_hash = ? AND version = ? "
+                "ORDER BY created_at ASC",
+                (signature_hash, surface_hash, version),
+            )
+            return [
+                Signal(
+                    kind=kind,
+                    content=content,
+                    weight=weight,
+                    data=json.loads(data_json),
+                    created_at=datetime.fromisoformat(created_at),
+                )
+                for kind, content, weight, data_json, created_at in cur.fetchall()
+            ]
+
+    def set_fitness(
+        self, signature_hash: str, surface_hash: str, version: int, fitness: float
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE variants SET fitness = ? "
+                "WHERE signature_hash = ? AND surface_hash = ? AND version = ?",
+                (fitness, signature_hash, surface_hash, version),
+            )
+            self._conn.commit()
+
+    def _mirror(self, signature_hash: str, surface_hash: str, version: int) -> None:
+        """Write the newly promoted champion as a readable .py file."""
+        if self.mirror_dir is None:
+            return
+        variant = self.get(signature_hash, surface_hash, version)
+        if variant is None:
+            return
+        self.mirror_dir.mkdir(parents=True, exist_ok=True)
+        name = _mirror_stem(variant)
+        (self.mirror_dir / f"{name}.py").write_text(render_champion(variant))
+
+
+def _mirror_stem(v: Variant) -> str:
+    base = "".join(c if c.isalnum() else "_" for c in (v.qualname or "fn")).strip("_")
+    return f"{base}_{v.signature_hash[:8]}"
+
+
+def render_champion(v: Variant) -> str:
+    """Render a variant as a standalone, readable Python file.
+
+    This is the maintainability contract: what the system learned is always
+    inspectable as ordinary source, never only as rows in a database. The
+    file is regenerated on every promotion; to take ownership of a body,
+    paste it into your own source under @syn, where it becomes the seed of
+    the next lineage.
+    """
+    name = (v.qualname.split(".")[-1] if v.qualname else "") or "solve"
+    lineage = f" <- v{', v'.join(map(str, v.parents))}" if v.parents else ""
+    header = (
+        f"# Champion for {v.qualname or v.signature_hash} "
+        f"(signature {v.signature_hash})\n"
+        f"# v{v.version} ({v.operator}{lineage}) — promoted {v.created_at.isoformat()}\n"
+        f"# reasoning: {v.body.reasoning}\n"
+        f"# Regenerated by synecdoche on every promotion; do not edit in place.\n"
+        f"# To take ownership, move the body into your source under @syn.\n"
+    )
+    if v.operator == "seed":
+        return header + "\n" + v.body.body
+    imports = "\n".join(v.body.imports)
+    body = v.body.body.replace("async def solve(", f"async def {name}(", 1)
+    parts = [p for p in (header.rstrip(), imports, body.rstrip()) if p]
+    return "\n\n".join(parts) + "\n"
 
 
 def open_archive(spec: str | Path | Archive | None) -> Archive:
@@ -403,21 +557,19 @@ def open_archive(spec: str | Path | Archive | None) -> Archive:
     if isinstance(spec, (str, Path)):
         p = Path(spec)
         if p.suffix == "":
-            p = p / "synecdoche.sqlite"
+            # A directory: SQLite for lineage, plus readable champion files.
+            return SqliteArchive(p / "synecdoche.sqlite", mirror_dir=p / "champions")
         return SqliteArchive(p)
     return spec  # already an Archive
 
 
-def now_utc() -> datetime:
-    return datetime.now(UTC)
-
-
 __all__ = [
     "Archive",
-    "ArchiveEntry",
-    "ArchiveMetrics",
     "MemoryArchive",
+    "Metrics",
     "SqliteArchive",
+    "Variant",
     "now_utc",
     "open_archive",
+    "render_champion",
 ]

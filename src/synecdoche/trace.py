@@ -7,12 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 
-from .archive import now_utc
+from .evolution import now_utc
 
 
 @dataclass
 class TraceEvent:
-    kind: str  # "call_start" | "call_end" | "tool_call" | "helper_call" | "cache_hit" | "compile" | "repair"
+    kind: str  # "call_start" | "call_end" | "tool_call" | "cache_hit" | "vary" | "signal" | "backward" | "evolve" | "promote"
     name: str
     data: dict[str, Any] = field(default_factory=dict)
     at: datetime = field(default_factory=now_utc)

@@ -1,3 +1,5 @@
+# Operator: {{ operator }}
+
 # Target signature
 
 ```python
@@ -27,54 +29,49 @@
 {{ inputs_json }}
 ```
 
-{% if archive_neighbors -%}
-# Style reference — prior archived bodies (not callable)
+{% if parents -%}
+# Parent{{ 's' if parents|length > 1 else '' }}
 
-{% for entry in archive_neighbors -%}
-## {{ entry.qualname }}
+{% for p in parents -%}
+## Parent {{ p.index }}
 
+{{ p.reasoning }}
+
+```python
+{{ p.body }}
+```
+
+{% endfor -%}
+{%- endif %}
+
+{% if signals -%}
+# Signals against parent 1
+
+{% for s in signals -%}
+- **{{ s.kind }}** (weight {{ '%+.2f'|format(s.weight) }}): {{ s.content }}
+{%- if s.data_json and s.data_json != '{}' %}
+  structured: `{{ s.data_json }}`
+{%- endif %}
+{% endfor %}
+{%- endif %}
+
+{% if neighbors -%}
+# Style reference — champions of other signatures (not callable)
+
+{% for entry in neighbors -%}
 {{ entry.reasoning }}
 
 ```python
 {{ entry.body }}
 ```
 
-{% endfor %}
+{% endfor -%}
 {%- endif %}
 
-{% if repair -%}
-# REPAIR CONTEXT
-
-The prior body raised. Revise it.
-
-## Prior body
-
-```python
-{{ repair.prior_body }}
-```
-
-## Failure
-
-- Type: `{{ repair.exception_type }}`
-- Message: `{{ repair.exception_message }}`
-{% if repair.exception_args -%}
-- Structured args: `{{ repair.exception_args_json }}`
-{%- endif %}
-{% if repair.failing_line is not none -%}
-- Line: {{ repair.failing_line }}
-{%- endif %}
-
-{% if repair.trace_excerpt -%}
-## Last tool/helper calls before failure
-
-{% for t in repair.trace_excerpt -%}
-- {{ t }}
-{% endfor %}
-{%- endif %}
-
-{% if repair.prior_attempts -%}
-## Prior repair attempts: {{ repair.prior_attempts }}
-{%- endif %}
-
-Emit a revised body. Be more defensive where the exception implicates, but do not change the signature and do not add libraries outside the sandbox allow-list.
+{% if operator == 'spawn' -%}
+Emit the first body for this signature.
+{%- elif operator == 'mutate' -%}
+Emit a descendant of parent 1. Resolve every hard signal; move in the direction of the soft signals; change nothing the signals do not implicate. Do not change the signature and do not add libraries outside the sandbox allow-list.
+{%- elif operator == 'cross' -%}
+Emit one body recombining the strengths of both parents. Do not change the signature and do not add libraries outside the sandbox allow-list.
 {%- endif %}

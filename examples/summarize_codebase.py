@@ -1,9 +1,10 @@
-"""Full @rt.recursion example — LLM compiles a body that calls an MCP server.
+"""@syn + tools — generate a body that calls an MCP server.
 
-This mirrors the design spec's canonical example: the model writes a
-`solve` body that reads files through a FastMCP filesystem server and
-assembles a typed `Summary` of the target codebase. The body is archived
-after the first successful call; subsequent runs hit the cache.
+The function below has no body, so the first call compiles one: the model
+writes a `solve` body that reads files through a FastMCP filesystem server
+and assembles a typed `Summary`. The compiled body is cached against
+(signature, tool surface); subsequent runs skip compilation. If it ever
+raises, the exception becomes the compile context for a fixed descendant.
 
 Prerequisites:
 
@@ -24,7 +25,7 @@ from fastmcp import Client
 from pydantic import BaseModel
 from pydantic_ai.models.anthropic import AnthropicModel
 
-from synecdoche import Runtime
+import synecdoche as syn
 
 
 class ModuleSummary(BaseModel):
@@ -39,17 +40,17 @@ class Summary(BaseModel):
     major_modules: list[ModuleSummary]
 
 
-rt = Runtime(
-    model_recursion=AnthropicModel("claude-opus-4-7"),
+syn.configure(
+    model_code=AnthropicModel("claude-opus-4-7"),
     model_infer=AnthropicModel("claude-haiku-4-5"),
     mcp=[Client("stdio://mcp-server-filesystem")],
-    archive="./.archive",
+    archive="./.synecdoche",
     heal=True,
     trace="stdout",
 )
 
 
-@rt.recursion
+@syn
 def summarize_codebase(root: Path) -> Summary:
     """Summarize the architecture of a codebase at the given root.
 
@@ -64,3 +65,7 @@ if __name__ == "__main__":
     target = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     result = summarize_codebase(target)
     print(result.model_dump_json(indent=2))
+
+    champ = syn.champion(summarize_codebase)
+    print(f"\n# champion: v{champ.version} ({champ.operator}), score {champ.score():.2f}")
+    print("# The champion is also mirrored at ./.synecdoche/champions/ as readable source.")
