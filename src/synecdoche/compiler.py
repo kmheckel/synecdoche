@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from jinja2 import Template
 from pydantic import BaseModel, Field
@@ -28,22 +28,10 @@ if TYPE_CHECKING:
     from .evolution import Variation
 
 
-class InlineHelper(BaseModel):
-    """A helper function declared inline by a generated body."""
-
-    kind: Literal["jit", "oracle"]
-    name: str = Field(pattern=r"^[a-z_][a-z0-9_]*$")
-    signature: str = Field(
-        description="Python signature line with types, e.g. `(path: Path, head: str) -> FileKind`"
-    )
-    docstring: str = Field(default="")
-
-
 class GeneratedBody(BaseModel):
     """Structured output of the compiler: the genome of one variant."""
 
     reasoning: str = Field(description="One paragraph explaining the approach. Archived for audit.")
-    helpers: list[InlineHelper] = Field(default_factory=list)
     imports: list[str] = Field(
         default_factory=list,
         description="Python import statements, one per line, from the sandbox allow-list only.",
@@ -116,43 +104,33 @@ class Compiler:
 
 
 class Inferencer:
-    """Wraps a pydantic-ai Agent to emit a typed value of a given return type.
+    """Backs the `infer` builtin available inside generated bodies: one
+    judgment call per use, nothing archived."""
 
-    This is the oracle path: the model *is* the function body, one inference
-    per call, nothing archived.
-    """
-
-    def __init__(self, model: Model, output_type: Any, system_prompt: str | None = None) -> None:
+    def __init__(self, model: Model, output_type: Any = str) -> None:
         self._model = model
-        self._output_type = output_type
         self._agent: Agent[None, Any] = Agent(
             model,
             output_type=output_type,
-            system_prompt=system_prompt or _INFER_SYSTEM_PROMPT,
+            system_prompt=_INFER_SYSTEM_PROMPT,
         )
 
-    async def infer(self, *, signature_line: str, docstring: str, inputs: dict[str, Any]) -> Any:
+    async def judge(self, *, instruction: str, data: str = "") -> Any:
         prompt = (
-            f"# Target signature\n\n"
-            f"```python\n{signature_line}\n"
-            f'    """{docstring}"""\n'
-            f"```\n\n"
-            f"# Inputs\n\n"
-            f"```json\n{_safe_inputs_json(inputs)}\n```\n\n"
-            f"Produce the typed return value directly. Your output will be validated "
-            f"against the declared return type."
+            f"# Instruction\n\n{instruction}\n\n"
+            f"# Data\n\n{data}\n\n"
+            f"Answer with the result only — no preamble, no explanation."
         )
         result = await self._agent.run(prompt)
         return result.output
 
 
 _INFER_SYSTEM_PROMPT = (
-    "You are resolving a typed function via a single inference. The user will "
-    "provide a Python signature, a docstring describing the task, and input "
-    "values. Return the typed result directly — no explanation, no prose, just "
-    "the structured value. If the task cannot be completed, raise a clearly "
-    "structured error using the tool mechanism provided to you."
+    "You are the `infer` primitive inside a running program: one judgment "
+    "call, invoked from generated code. The instruction says what to decide; "
+    "the data is what to decide about. Answer with the result only — the "
+    "caller is code, not a person, and will parse your reply verbatim."
 )
 
 
-__all__ = ["Compiler", "GeneratedBody", "Inferencer", "InlineHelper", "render_user_prompt"]
+__all__ = ["Compiler", "GeneratedBody", "Inferencer", "render_user_prompt"]

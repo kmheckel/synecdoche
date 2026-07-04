@@ -2,7 +2,7 @@
 
 Transforms resolve their backend at call time: an explicit ``backend=``
 argument wins, otherwise the module default set by ``configure()`` is used.
-Late binding matters — ``@syn.jit`` runs at import time, usually before any
+Late binding matters — ``@syn`` runs at import time, usually before any
 backend exists.
 """
 

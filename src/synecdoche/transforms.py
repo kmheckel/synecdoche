@@ -1,30 +1,30 @@
-"""The transforms: the whole public surface, as composable functions.
+"""The public surface: one decorator, and functions that act on it.
 
-Like an array framework, synecdoche is used through a handful of
-higher-order functions that take a typed Python function and return (or act
-on) a transformed one:
+``@syn`` (the module itself is the decorator; ``syn.fn`` is the same thing
+with a name) turns a typed signature + docstring into a function whose body
+is generated, cached, and improved under feedback. Everything else operates
+on decorated functions:
 
 ===============  ============================================================
-``jit``          compile the function — from its source if it has a body,
-                 from its signature + docstring if it doesn't — cache by
-                 (signature, tool surface), heal on exception
-``oracle``       treat the model itself as the function: one typed
-                 inference per call, nothing compiled or cached
+``fn`` / ``@syn``  generate code to meet the spec — from the handwritten
+                 body if there is one, from the signature + docstring if
+                 not — cache by (signature, tool surface), heal on exception
 ``vmap``         map a function over the leading argument, concurrently
-``feedback``     record a critique against the current compiled body
-``descend``      one optimizer step: critique -> revised program
-``evolve``       a training loop: breed variants against examples, keep
+``feedback``     record a critique against the current body
+``descend``      one update step: critiques -> revised program
+``evolve``       the training loop: breed variants against examples, keep
                  the fittest
 ``solidify``     render the current body back into committable source
-``lineage`` /    inspect the compiled artifact, like inspecting a lowered
-``champion`` /   representation — except here it is ordinary Python
+``lineage`` /    inspect the learned artifact — which is always ordinary,
+``champion`` /   readable Python, never opaque state
 ``signals`` / ``rollback``
 ===============  ============================================================
 
-There is no ``grad``: programs, not tensors, are the parameters here, so
-the derivative of a function with respect to a critique is another
-function. ``feedback`` plays backprop (it accumulates the signal);
-``descend`` plays the optimizer step (it applies them).
+This is heuristic learning in the sense of Weng's "Learning Beyond
+Gradients": the loop of state, action, feedback, update — where the thing
+being updated is program structure, not weights. ``feedback`` accumulates
+the learning signal; ``descend`` and ``evolve`` apply it; the archive keeps
+the history explicit, readable, and refactorable.
 """
 
 from __future__ import annotations
@@ -47,48 +47,34 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 # ---------------------------------------------------------------------------
-# jit / oracle — bring functions onto the backend
+# The decorator
 # ---------------------------------------------------------------------------
 
 
-def jit(
+def fn(
     f: F | None = None,
     *,
     backend: Backend | None = None,
     model: Any = None,
     max_repairs: int | None = None,
 ) -> Any:
-    """Compile a typed function on first call and cache the result.
+    """Generate code to meet the function specification. ``@syn`` is this.
 
     A handwritten body is kept as the lineage's generation zero and runs
     natively; when it raises, the exception becomes the compile context for
     a fixed descendant. An empty body (docstring / ``pass`` / ``...``) is
-    compiled from intent alone. Either way the cache key is
+    generated from the spec alone. Either way the cache key is
     ``(signature, tool surface)`` — change the types or the tools and you
-    get a fresh compilation, exactly like retracing.
+    get a fresh generation.
+
+    Generated bodies are flat by construction: they may call mounted MCP
+    tools and the built-in ``infer`` primitive (one typed judgment call),
+    but can never spawn further synthesized functions. Composition happens
+    in your own Python, where the call graph stays readable.
     """
 
     def wrap(func: F) -> F:
-        return Fn(func, kind="jit", backend=backend, model=model, max_repairs=max_repairs)  # type: ignore[return-value]
-
-    return wrap(f) if f is not None else wrap
-
-
-def oracle(
-    f: F | None = None,
-    *,
-    backend: Backend | None = None,
-    model: Any = None,
-) -> Any:
-    """Treat the model as the function: one typed inference per call.
-
-    Nothing is compiled and nothing is archived — the neural sequence model
-    is invoked as a black-box implementation of the signature, and its
-    output is validated against the declared return type.
-    """
-
-    def wrap(func: F) -> F:
-        return Fn(func, kind="oracle", backend=backend, model=model)  # type: ignore[return-value]
+        return Fn(func, backend=backend, model=model, max_repairs=max_repairs)  # type: ignore[return-value]
 
     return wrap(f) if f is not None else wrap
 
@@ -102,10 +88,9 @@ def vmap(f: Callable[..., Any], *, concurrency: int | None = None) -> Callable[.
     """Map ``f`` over its leading argument, concurrently.
 
     ``vmap(f)(xs, *rest)`` calls ``f(x, *rest)`` for every ``x`` in ``xs``
-    and returns the results in order. Transformed functions run
-    concurrently on the event loop (useful: oracle calls batch into
-    parallel inferences); plain functions are mapped as-is. Set
-    ``concurrency`` to bound the fan-out.
+    and returns the results in order. Decorated functions run concurrently
+    on the event loop; plain functions are mapped as-is. Set ``concurrency``
+    to bound the fan-out.
     """
 
     def mapped(items: Any, *args: Any, **kwargs: Any) -> Any:
@@ -134,31 +119,31 @@ async def _acall(f: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# feedback / descend — the gradient surrogate
+# feedback / descend — the learning signal and the update step
 # ---------------------------------------------------------------------------
 
 
 def feedback(f: Callable[..., Any], score: float, note: str = "") -> None:
-    """Record a critique against the current compiled body.
+    """Record a critique against the current body.
 
     ``score`` is in [0, 1]: below 0.5 pushes away from the current body,
     above 0.5 reinforces it. The note is what the compiler actually reads —
     say *what was wrong*, not just how wrong it was. Exceptions record
     themselves; this is for the failures that don't raise.
     """
-    fn = _jit_fn(f, "feedback")
+    fn = as_fn(f, "feedback")
     champ = _require_champion(fn)
     fn.backend._record_signal(fn, champ, Signal.from_feedback(score, note))
 
 
 def descend(f: Callable[..., Any]) -> Callable[..., Any]:
-    """One optimizer step: recompile the current body under its accumulated
+    """One update step: regenerate the current body under its accumulated
     signals, shadow-validate against the last inputs, promote the result.
 
     Returns ``f`` — the program *is* the parameter, and its new state lives
     in the archive.
     """
-    fn = _jit_fn(f, "descend")
+    fn = as_fn(f, "descend")
     run_maybe_async(fn.backend._descend(fn))
     return f
 
@@ -180,11 +165,13 @@ def evolve(
     """Breed variants of ``f`` against examples and keep the fittest.
 
     Each generation produces ``population`` offspring — mutations of the
-    fittest, crossovers of the top two, fresh compilations — and scores
+    fittest, crossovers of the top two, fresh generations — and scores
     every one on all examples (validated success x optional ``score``).
     The fittest variant overall is promoted and serves subsequent calls.
+    This is the loop behind heuristic discovery: programs as hypotheses,
+    an evaluator as the fitness function, selection over readable code.
     """
-    fn = _jit_fn(f, "evolve")
+    fn = as_fn(f, "evolve")
     sets = [
         ex if isinstance(ex, dict) else bind_inputs(fn._original, tuple(ex), {}) for ex in examples
     ]
@@ -201,27 +188,27 @@ def evolve(
 
 
 # ---------------------------------------------------------------------------
-# Introspection — the compiled artifact is ordinary Python
+# Introspection — the learned artifact is ordinary Python
 # ---------------------------------------------------------------------------
 
 
 def champion(f: Callable[..., Any]) -> Variant | None:
     """The variant currently serving calls, or None before the first call."""
-    fn = _jit_fn(f, "champion")
+    fn = as_fn(f, "champion")
     surface_hash = fn.backend._surface_hash_now()
     return fn.backend.archive.champion(fn.signature.signature_hash, surface_hash)
 
 
 def lineage(f: Callable[..., Any]) -> list[Variant]:
     """Every variant ever produced for this signature, in version order."""
-    fn = _jit_fn(f, "lineage")
+    fn = as_fn(f, "lineage")
     surface_hash = fn.backend._surface_hash_now()
     return fn.backend.archive.population(fn.signature.signature_hash, surface_hash)
 
 
 def signals(f: Callable[..., Any]) -> list[Signal]:
     """All signals recorded against the current champion."""
-    fn = _jit_fn(f, "signals")
+    fn = as_fn(f, "signals")
     champ = _require_champion(fn)
     return fn.backend.archive.signals_for(
         fn.signature.signature_hash, champ.surface_hash, champ.version
@@ -233,10 +220,10 @@ def solidify(f: Callable[..., Any], path: str | Path | None = None) -> str:
 
     Returns the source (and writes it to ``path`` if given), with the body
     renamed to the function's own name and a provenance header. Commit it
-    and it is deterministic code; decorate it with ``@syn.jit`` again and
-    it seeds the next lineage.
+    and it is deterministic code; decorate it with ``@syn`` again and it
+    seeds the next lineage.
     """
-    fn = _jit_fn(f, "solidify")
+    fn = as_fn(f, "solidify")
     champ = _require_champion(fn)
     name = fn.signature.qualname.split(".")[-1]
     if champ.operator == "seed":
@@ -264,7 +251,7 @@ def solidify(f: Callable[..., Any], path: str | Path | None = None) -> str:
 
 def rollback(f: Callable[..., Any]) -> Variant | None:
     """Demote the champion to its first parent. Returns the new champion."""
-    fn = _jit_fn(f, "rollback")
+    fn = as_fn(f, "rollback")
     champ = _require_champion(fn)
     return fn.backend.archive.rollback(fn.signature.signature_hash, champ.surface_hash)
 
@@ -272,16 +259,6 @@ def rollback(f: Callable[..., Any]) -> Variant | None:
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
-
-
-def _jit_fn(f: Callable[..., Any], transform: str) -> Fn:
-    fn = as_fn(f, transform)
-    if fn.kind != "jit":
-        raise FrameworkError(
-            f"syn.{transform}() applies to @syn.jit functions — an oracle has "
-            f"no compiled body to act on."
-        )
-    return fn
 
 
 def _require_champion(fn: Fn) -> Variant:
@@ -297,9 +274,8 @@ __all__ = [
     "descend",
     "evolve",
     "feedback",
-    "jit",
+    "fn",
     "lineage",
-    "oracle",
     "rollback",
     "signals",
     "solidify",

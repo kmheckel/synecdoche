@@ -2,14 +2,15 @@
 
 The surface has two kinds of entries:
 
-- **mcp**: tools discovered from a mounted FastMCP server. The runtime
+- **mcp**: tools discovered from a mounted FastMCP server. The backend
   dispatches them by calling `client.call_tool(...)`.
-- **inline_helper**: helpers declared by the compiler inside a generated body.
-  The runtime dispatches them by recursively compiling/executing the helper
-  under the same pipeline.
+- **builtin**: primitives every generated body gets, currently just
+  `infer` — a single typed judgment call to the model. This is the only
+  nesting generated code is allowed: bodies are flat by construction and
+  can never spawn further synthesized functions.
 
-We compute a `surface_hash` over the MCP portion only — inline helpers
-are body-local and don't invalidate archive entries.
+We compute a `surface_hash` over the MCP portion only — builtins are
+constant and don't invalidate archive entries.
 """
 
 from __future__ import annotations
@@ -29,8 +30,8 @@ class ToolSpec:
     description: str
     params_schema: dict[str, Any]
     return_schema: dict[str, Any]
-    source: Literal["mcp", "inline_helper"]
-    mcp_client_id: int | None = None  # index into Runtime._clients
+    source: Literal["mcp", "builtin"]
+    mcp_client_id: int | None = None  # index into Backend._mcp_clients
 
     def render_stub(self) -> str:
         """Render a typed async stub for sandbox typechecking."""
@@ -58,17 +59,6 @@ class ToolSurface:
     tools: tuple[ToolSpec, ...] = field(default_factory=tuple)
     surface_hash: str = ""
 
-    def with_inline_helpers(self, helpers: list[ToolSpec]) -> ToolSurface:
-        """Return a new surface with body-local inline helpers appended.
-
-        Does not recompute `surface_hash` — helpers are body-local and
-        don't affect cross-run identity.
-        """
-        return ToolSurface(
-            tools=tuple(self.tools) + tuple(helpers),
-            surface_hash=self.surface_hash,
-        )
-
     def render_stubs(self) -> str:
         """Render all stubs as a single Python source fragment."""
         return "\n".join(t.render_stub() for t in self.tools)
@@ -83,9 +73,37 @@ class ToolSurface:
         return None
 
 
+INFER_SPEC = ToolSpec(
+    name="infer",
+    description=(
+        "Ask the model for a single judgment: classification, extraction, "
+        "phrasing — anything that is perception rather than algorithm. "
+        "`instruction` says what to decide; `data` is the text to decide "
+        "about. Returns the model's answer as a string (ask for JSON in the "
+        "instruction if you need structure). This is a real inference call: "
+        "use it for judgment, not for computation you can express as code."
+    ),
+    params_schema={
+        "type": "object",
+        "properties": {
+            "instruction": {"type": "string"},
+            "data": {"type": "string"},
+        },
+        "required": ["instruction"],
+    },
+    return_schema={"type": "string"},
+    source="builtin",
+)
+
+
+def empty_surface() -> ToolSurface:
+    """The surface with no MCP tools mounted — builtins only."""
+    return ToolSurface(tools=(INFER_SPEC,), surface_hash="empty")
+
+
 async def build_mcp_surface(clients: list[Client]) -> ToolSurface:
     """Connect to every MCP client, enumerate its tools, and build a ToolSurface."""
-    tools: list[ToolSpec] = []
+    tools: list[ToolSpec] = [INFER_SPEC]
     for idx, client in enumerate(clients):
         async with client:
             raw_tools = await client.list_tools()
@@ -157,4 +175,4 @@ def _ret_hint(schema: dict[str, Any]) -> str:
     return mapping.get(t, "object")
 
 
-__all__ = ["ToolSpec", "ToolSurface", "build_mcp_surface"]
+__all__ = ["INFER_SPEC", "ToolSpec", "ToolSurface", "build_mcp_surface", "empty_surface"]

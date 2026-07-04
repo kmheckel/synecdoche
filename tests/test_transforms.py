@@ -14,7 +14,7 @@ import synecdoche as syn
 def test_handwritten_body_runs_natively_without_model_calls(stub_model) -> None:
     be = syn.Backend(model=stub_model.as_model())  # nothing pushed: any model call raises
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def double(x: int) -> int:
         return x * 2
 
@@ -23,16 +23,16 @@ def test_handwritten_body_runs_natively_without_model_calls(stub_model) -> None:
     assert champ is not None
     assert champ.operator == "seed"
     assert "return x * 2" in champ.body.body
-    assert "@syn.jit" not in champ.body.body  # decorators stripped from the seed
+    assert "@syn" not in champ.body.body  # decorators stripped from the seed
 
 
 def test_handwritten_body_heals_into_a_descendant(stub_model) -> None:
     # The handwritten seed crashes on negatives; the mutation fixes it.
     healed = "async def solve(x: int) -> int:\n    return abs(x) * 2\n"
-    stub_model.push({"reasoning": "handle negatives", "helpers": [], "imports": [], "body": healed})
+    stub_model.push({"reasoning": "handle negatives", "imports": [], "body": healed})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def double(x: int) -> int:
         if x < 0:
             raise ValueError("negative input")
@@ -58,13 +58,13 @@ def test_feedback_then_descend_revises_the_program(stub_model) -> None:
     step = "async def solve(x: int) -> int:\n    return x * 2\n"
     stub_model.extend(
         [
-            {"reasoning": "first", "helpers": [], "imports": [], "body": first},
-            {"reasoning": "doubled per feedback", "helpers": [], "imports": [], "body": step},
+            {"reasoning": "first", "imports": [], "body": first},
+            {"reasoning": "doubled per feedback", "imports": [], "body": step},
         ]
     )
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def grow(x: int) -> int:
         """Grow x."""
 
@@ -83,10 +83,10 @@ def test_feedback_then_descend_revises_the_program(stub_model) -> None:
 
 def test_descend_without_signals_is_an_error(stub_model) -> None:
     first = "async def solve(x: int) -> int:\n    return x\n"
-    stub_model.push({"reasoning": "r", "helpers": [], "imports": [], "body": first})
+    stub_model.push({"reasoning": "r", "imports": [], "body": first})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def ident(x: int) -> int:
         """."""
 
@@ -108,10 +108,10 @@ def test_feedback_score_bounds() -> None:
 
 def test_vmap_over_a_jit_function(stub_model) -> None:
     body = "async def solve(x: int) -> int:\n    return x * 10\n"
-    stub_model.push({"reasoning": "r", "helpers": [], "imports": [], "body": body})
+    stub_model.push({"reasoning": "r", "imports": [], "body": body})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def tenfold(x: int) -> int:
         """Multiply by ten."""
 
@@ -124,10 +124,10 @@ def test_vmap_over_a_plain_function() -> None:
 
 def test_vmap_respects_concurrency_bound(stub_model) -> None:
     body = "async def solve(x: int) -> int:\n    return x\n"
-    stub_model.push({"reasoning": "r", "helpers": [], "imports": [], "body": body})
+    stub_model.push({"reasoning": "r", "imports": [], "body": body})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def ident(x: int) -> int:
         """."""
 
@@ -168,7 +168,7 @@ def test_evolve_selects_the_fittest_variant(stub_model) -> None:
     )
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def double(x: int) -> int:
         """Double x."""
 
@@ -191,10 +191,10 @@ def test_evolve_selects_the_fittest_variant(stub_model) -> None:
 
 def test_solidify_renders_committable_source(stub_model, tmp_path) -> None:
     body = "async def solve(x: int) -> int:\n    return x * 2\n"
-    stub_model.push({"reasoning": "double it", "helpers": [], "imports": [], "body": body})
+    stub_model.push({"reasoning": "double it", "imports": [], "body": body})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def double(x: int) -> int:
         """Double x."""
 
@@ -211,7 +211,7 @@ def test_solidify_renders_committable_source(stub_model, tmp_path) -> None:
 def test_solidify_of_a_seed_returns_the_handwritten_source(stub_model) -> None:
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def triple(x: int) -> int:
         return x * 3
 

@@ -1,7 +1,7 @@
 [project]
 name = "synecdoche"
 version = "0.2.0"
-description = "Composable transformations of typed Python functions, with a neural sequence model as the compiler."
+description = "One decorator: you write the spec, the runtime learns the code. Heuristic learning as a language primitive."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

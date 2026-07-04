@@ -10,7 +10,7 @@ from synecdoche.evolution import Signal
 
 
 def _mk_variant(version: int = 1, parents: tuple[int, ...] = (), promoted: bool = True) -> Variant:
-    body = GeneratedBody(reasoning="r", helpers=[], imports=[], body="async def solve(): return 1")
+    body = GeneratedBody(reasoning="r", imports=[], body="async def solve(): return 1")
     return Variant(
         signature_hash="sig1",
         surface_hash="surf1",

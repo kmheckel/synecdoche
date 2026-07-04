@@ -45,7 +45,6 @@ def now_utc() -> datetime:
 
 @dataclass
 class Budget:
-    max_recursion_depth: int = 6
     max_tool_calls_per_frame: int = 200
     wall_time_seconds: float | None = None
 

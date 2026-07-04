@@ -17,13 +17,13 @@ def test_healing_promotes_mutated_descendant(stub_model) -> None:
     good_body = "async def solve(x: int) -> dict:\n    return {'v': x}\n"
     stub_model.extend(
         [
-            {"reasoning": "first attempt", "helpers": [], "imports": [], "body": bad_body},
-            {"reasoning": "healed", "helpers": [], "imports": [], "body": good_body},
+            {"reasoning": "first attempt", "imports": [], "body": bad_body},
+            {"reasoning": "healed", "imports": [], "body": good_body},
         ]
     )
     be = syn.Backend(model=stub_model.as_model(), heal=True, max_repairs=2)
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def go(x: int) -> Out:
         """."""
 
@@ -43,10 +43,10 @@ def test_healing_promotes_mutated_descendant(stub_model) -> None:
 
 def test_healing_disabled_raises_compilation_error(stub_model) -> None:
     bad_body = "async def solve(x: int) -> dict:\n    raise ValueError('boom')\n"
-    stub_model.push({"reasoning": "first attempt", "helpers": [], "imports": [], "body": bad_body})
+    stub_model.push({"reasoning": "first attempt", "imports": [], "body": bad_body})
     be = syn.Backend(model=stub_model.as_model(), heal=False)
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def go(x: int) -> Out:
         """."""
 

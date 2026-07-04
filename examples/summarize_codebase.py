@@ -1,4 +1,4 @@
-"""jit + tools — compile a body that calls an MCP server.
+"""@syn + tools — generate a body that calls an MCP server.
 
 The function below has no body, so the first call compiles one: the model
 writes a `solve` body that reads files through a FastMCP filesystem server
@@ -42,15 +42,15 @@ class Summary(BaseModel):
 
 syn.configure(
     model_code=AnthropicModel("claude-opus-4-7"),
-    model_oracle=AnthropicModel("claude-haiku-4-5"),
+    model_infer=AnthropicModel("claude-haiku-4-5"),
     mcp=[Client("stdio://mcp-server-filesystem")],
-    archive="./.archive",
+    archive="./.synecdoche",
     heal=True,
     trace="stdout",
 )
 
 
-@syn.jit
+@syn
 def summarize_codebase(root: Path) -> Summary:
     """Summarize the architecture of a codebase at the given root.
 
@@ -68,4 +68,4 @@ if __name__ == "__main__":
 
     champ = syn.champion(summarize_codebase)
     print(f"\n# champion: v{champ.version} ({champ.operator}), score {champ.score():.2f}")
-    print("# syn.solidify(summarize_codebase) renders it back into committable source.")
+    print("# The champion is also mirrored at ./.synecdoche/champions/ as readable source.")

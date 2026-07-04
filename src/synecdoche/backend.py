@@ -1,11 +1,10 @@
 """The Backend: models, tools, archive, sandbox — the substrate transforms run on.
 
-Analogous to a device in an array framework: user code never talks to it
-directly. Transforms (``syn.jit``, ``syn.oracle``, ``syn.vmap``, ...) bind
-functions to a backend — explicitly via ``backend=``, or implicitly through
-the module default set by ``synecdoche.configure()``.
+User code rarely talks to it directly: ``@syn`` binds functions to a
+backend — explicitly via ``backend=``, or implicitly through the module
+default set by ``synecdoche.configure()``.
 
-Every jit call resolves the same way: find the champion variant for
+Every call resolves the same way: find the champion variant for
 ``(signature, tool surface)``, execute it (natively if it is your
 handwritten seed, sandboxed if it was compiled), validate the result
 against the declared return type, record the evidence. Failure is not an
@@ -35,7 +34,7 @@ from .exceptions import (
 from .fn import Fn
 from .sandbox import MontySandbox, Sandbox
 from .signature import CallSignature
-from .surface import ToolSpec, ToolSurface, build_mcp_surface
+from .surface import ToolSpec, ToolSurface, build_mcp_surface, empty_surface
 from .trace import TraceEvent, Tracer, resolve_tracer
 
 if TYPE_CHECKING:
@@ -52,7 +51,7 @@ class Backend:
         # Models — either a single one or split by role.
         model: Model | None = None,
         model_code: Model | None = None,  # compiles bodies (spawn/mutate/cross)
-        model_oracle: Model | None = None,  # answers oracle fns
+        model_infer: Model | None = None,  # answers the infer builtin
         # External capability surface.
         mcp: list[Client] | None = None,
         # Storage.
@@ -64,17 +63,14 @@ class Backend:
         max_repairs: int = 2,
         shadow_validate: bool = True,
         # Budgets.
-        max_recursion_depth: int = 6,
         max_tool_calls_per_frame: int = 200,
         # Observability.
         trace: Any = None,
     ) -> None:
-        if model is None and (model_code is None or model_oracle is None):
-            raise ValueError(
-                "Provide either `model=...` or both `model_code=` and `model_oracle=`."
-            )
+        if model is None and (model_code is None or model_infer is None):
+            raise ValueError("Provide either `model=...` or both `model_code=` and `model_infer=`.")
         self.model_code: Model = model_code or model  # type: ignore[assignment]
-        self.model_oracle: Model = model_oracle or model  # type: ignore[assignment]
+        self.model_infer: Model = model_infer or model  # type: ignore[assignment]
 
         self._mcp_clients: list[Client] = list(mcp or [])
         self.archive: Archive = open_archive(archive)
@@ -83,10 +79,7 @@ class Backend:
         self.heal = heal
         self.max_repairs = max_repairs
         self.shadow_validate = shadow_validate
-        self.budget = Budget(
-            max_recursion_depth=max_recursion_depth,
-            max_tool_calls_per_frame=max_tool_calls_per_frame,
-        )
+        self.budget = Budget(max_tool_calls_per_frame=max_tool_calls_per_frame)
         self.tracer: Tracer = resolve_tracer(trace)
 
         # Lazy: surface is populated on first use inside an event loop.
@@ -100,49 +93,17 @@ class Backend:
         # Per-backend compiler (caches system-prompt prefix inside pydantic-ai).
         self._compiler = Compiler(self.model_code)
 
-        # Oracle agents keyed by return-type, lazy init.
-        self._oracle_cache: dict[Any, Inferencer] = {}
+        # The `infer` builtin, lazy init.
+        self._infer_agent: Inferencer | None = None
 
     # ------------------------------------------------------------------
-    # Oracle pipeline
+    # The call pipeline: champion -> execute -> select
     # ------------------------------------------------------------------
 
-    async def _call_oracle(self, fn: Fn, inputs: dict[str, Any]) -> Any:
+    async def _call_fn(self, fn: Fn, inputs: dict[str, Any]) -> Any:
         sig = fn.signature
-        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"kind": "oracle"}))
-        model = fn._model or self.model_oracle
-        key = (sig.return_type, id(model))
-        oracle = self._oracle_cache.get(key)
-        if oracle is None:
-            oracle = Inferencer(model, sig.return_type)
-            self._oracle_cache[key] = oracle
-        try:
-            value = await oracle.infer(
-                signature_line=sig.render(),
-                docstring=sig.docstring,
-                inputs=inputs,
-            )
-        except Exception as e:
-            self.tracer.emit(
-                TraceEvent("call_end", sig.qualname, {"kind": "oracle", "error": type(e).__name__})
-            )
-            raise
-        self.tracer.emit(TraceEvent("call_end", sig.qualname, {"kind": "oracle"}))
-        return _validate_return(sig, value)
-
-    # ------------------------------------------------------------------
-    # Jit pipeline: champion -> execute -> select
-    # ------------------------------------------------------------------
-
-    async def _call_jit(self, fn: Fn, inputs: dict[str, Any], *, depth: int = 0) -> Any:
-        sig = fn.signature
-        if depth > self.budget.max_recursion_depth:
-            raise BudgetExceeded(
-                kind="depth", limit=self.budget.max_recursion_depth, measured=depth
-            )
-
         surface = await self._ensure_surface()
-        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"kind": "jit", "depth": depth}))
+        self.tracer.emit(TraceEvent("call_start", sig.qualname, {}))
 
         champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
         if champion is None:
@@ -202,7 +163,7 @@ class Backend:
                     TraceEvent(
                         "call_end",
                         sig.qualname,
-                        {"kind": "jit", "ok": False, "error": type(e).__name__, "attempt": attempt},
+                        {"ok": False, "error": type(e).__name__, "attempt": attempt},
                     )
                 )
                 if not self.heal or attempt >= max_repairs:
@@ -222,7 +183,7 @@ class Backend:
                     success=True,
                     latency_ms=elapsed,
                 )
-                self.tracer.emit(TraceEvent("call_end", sig.qualname, {"kind": "jit", "ok": True}))
+                self.tracer.emit(TraceEvent("call_end", sig.qualname, {"ok": True}))
                 return value
 
         raise CompilationError(
@@ -502,6 +463,7 @@ class Backend:
             body=body,
             created_at=now_utc(),
             promoted=promoted,
+            qualname=sig.qualname,
         )
         self.archive.insert(variant)
         if promoted:
@@ -571,7 +533,26 @@ class Backend:
 
             return invoke
 
-        return {t.name: wrap_mcp(t) for t in surface.tools if t.source == "mcp"}
+        async def infer(instruction: str, data: str = "") -> Any:
+            if self._infer_agent is None:
+                self._infer_agent = Inferencer(self.model_infer, str)
+            self.tracer.emit(TraceEvent("infer", "infer", {"instruction": _truncate(instruction)}))
+            out = await self._infer_agent.judge(instruction=instruction, data=data)
+            trace_frames.append(
+                TraceFrame(
+                    kind="infer",
+                    name="infer",
+                    args_summary=_truncate(instruction),
+                    result_summary=_truncate(out),
+                )
+            )
+            return out
+
+        functions: dict[str, Callable[..., Awaitable[Any]]] = {
+            t.name: wrap_mcp(t) for t in surface.tools if t.source == "mcp"
+        }
+        functions["infer"] = infer
+        return functions
 
     # ------------------------------------------------------------------
     # Tool-surface bootstrap
@@ -585,7 +566,7 @@ class Backend:
                 if self._mcp_clients:
                     self._surface = await build_mcp_surface(self._mcp_clients)
                 else:
-                    self._surface = ToolSurface(tools=(), surface_hash="empty")
+                    self._surface = empty_surface()
         return self._surface
 
     def _surface_hash_now(self) -> str:
@@ -593,7 +574,7 @@ class Backend:
         if self._surface is not None:
             return self._surface.surface_hash
         if not self._mcp_clients:
-            self._surface = ToolSurface(tools=(), surface_hash="empty")
+            self._surface = empty_surface()
             return self._surface.surface_hash
         try:
             asyncio.get_running_loop()

@@ -1,11 +1,11 @@
-"""The transformed function: what ``syn.jit`` and ``syn.oracle`` return.
+"""The decorated function: what ``@syn`` returns.
 
-An ``Fn`` is deliberately thin — a callable with a signature and a kind.
-Everything interesting about it lives elsewhere: its variants in the
-archive, its machinery in the backend, and all introspection in the
-module-level transforms (``syn.lineage(f)``, ``syn.solidify(f)``, ...).
-The call site never knows or cares whether the body it reaches was
-handwritten, synthesized, or is a direct inference.
+An ``Fn`` is deliberately thin — a callable with a signature. Everything
+interesting about it lives elsewhere: its variants in the archive, its
+machinery in the backend, and all introspection in the module-level
+functions (``syn.lineage(f)``, ``syn.solidify(f)``, ...). The call site
+never knows or cares whether the body it reaches was handwritten or
+generated.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import functools
 import inspect
 import textwrap
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from .config import current_backend
 from .exceptions import FrameworkError
@@ -25,35 +25,30 @@ from .signature import CallSignature
 if TYPE_CHECKING:
     from .backend import Backend
 
-Kind = Literal["jit", "oracle"]
-
 
 class Fn:
-    """A typed contract, callable through a backend.
+    """A typed spec, callable through a backend.
 
-    For ``kind='jit'`` with a handwritten body, that body is kept as the
-    *seed* — the lineage's generation zero, run natively until it fails.
-    With an empty body, the first call compiles one. For ``kind='oracle'``
-    every call is a single typed inference.
+    A handwritten body is kept as the *seed* — the lineage's generation
+    zero, run natively until it fails. An empty body means the first call
+    generates one.
     """
 
     def __init__(
         self,
         original: Callable[..., Any],
         *,
-        kind: Kind,
         backend: Backend | None = None,
         model: Any = None,
         max_repairs: int | None = None,
     ) -> None:
         self._original = original
-        self.kind: Kind = kind
         self.signature = CallSignature.from_function(original)
         self._backend_override = backend
         self._model = model
         self._max_repairs = max_repairs
         self._seed_source: str | None = None
-        if kind == "jit" and not _body_is_empty(original):
+        if not _body_is_empty(original):
             self._seed_source = _seed_source(original)
         self._last_inputs: dict[str, Any] | None = None
         functools.update_wrapper(self, original)
@@ -64,25 +59,20 @@ class Fn:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         inputs = bind_inputs(self._original, args, kwargs)
-        coro = self._invoke(inputs)
+        coro = self.backend._call_fn(self, inputs)
         if inspect.iscoroutinefunction(self._original):
             return coro  # declared async — the caller awaits, as they wrote it
         return run_maybe_async(coro)
 
-    async def _invoke(self, inputs: dict[str, Any]) -> Any:
-        if self.kind == "oracle":
-            return await self.backend._call_oracle(self, inputs)
-        return await self.backend._call_jit(self, inputs)
-
     def __repr__(self) -> str:
-        return f"<synecdoche.Fn {self.signature.qualname} kind={self.kind}>"
+        return f"<synecdoche.Fn {self.signature.qualname}>"
 
 
 def as_fn(f: Any, transform: str) -> Fn:
     if not isinstance(f, Fn):
         raise FrameworkError(
-            f"syn.{transform}() expects a transformed function "
-            f"(the result of @syn.jit or @syn.oracle), got {type(f).__name__}."
+            f"syn.{transform}() expects a decorated function "
+            f"(the result of @syn), got {type(f).__name__}."
         )
     return f
 
@@ -154,4 +144,4 @@ def bind_inputs(
     return dict(bound.arguments)
 
 
-__all__ = ["Fn", "Kind", "as_fn", "bind_inputs", "run_maybe_async"]
+__all__ = ["Fn", "as_fn", "bind_inputs", "run_maybe_async"]

@@ -13,15 +13,13 @@ class Summary(BaseModel):
     note: str
 
 
-def test_jit_compiles_at_first_call(stub_model) -> None:
+def test_fn_generates_at_first_call(stub_model) -> None:
     # Emit a GeneratedBody whose `body` returns a dict that validates as Summary.
     body_src = "async def solve(x: int) -> dict:\n    return {'value': x * 2, 'note': 'doubled'}\n"
-    stub_model.push(
-        {"reasoning": "Double x and tag it.", "helpers": [], "imports": [], "body": body_src}
-    )
+    stub_model.push({"reasoning": "Double x and tag it.", "imports": [], "body": body_src})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def double(x: int) -> Summary:
         """Double x and tag it."""
 
@@ -36,13 +34,13 @@ def test_jit_compiles_at_first_call(stub_model) -> None:
     assert champ.parents == ()
 
 
-def test_jit_cache_hit_skips_compile(stub_model) -> None:
+def test_fn_cache_hit_skips_compile(stub_model) -> None:
     # Only push once — if the backend calls the compiler twice, the stub raises.
     body_src = "async def solve(x: int) -> dict:\n    return {'value': x + 1, 'note': 'plus'}\n"
-    stub_model.push({"reasoning": "Add one.", "helpers": [], "imports": [], "body": body_src})
+    stub_model.push({"reasoning": "Add one.", "imports": [], "body": body_src})
     be = syn.Backend(model=stub_model.as_model())
 
-    @syn.jit(backend=be)
+    @syn.fn(backend=be)
     def inc(x: int) -> Summary:
         """Add one."""
 
@@ -54,11 +52,11 @@ def test_jit_cache_hit_skips_compile(stub_model) -> None:
 
 def test_default_backend_via_configure(stub_model) -> None:
     body_src = "async def solve(x: int) -> dict:\n    return {'value': x, 'note': 'id'}\n"
-    stub_model.push({"reasoning": "r", "helpers": [], "imports": [], "body": body_src})
+    stub_model.push({"reasoning": "r", "imports": [], "body": body_src})
     syn.configure(model=stub_model.as_model())
     try:
 
-        @syn.jit
+        @syn
         def ident(x: int) -> Summary:
             """."""
 
@@ -68,7 +66,7 @@ def test_default_backend_via_configure(stub_model) -> None:
 
 
 def test_no_backend_is_a_clear_error() -> None:
-    @syn.jit
+    @syn
     def orphan(x: int) -> int:
         """."""
 

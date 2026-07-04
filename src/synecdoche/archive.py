@@ -13,6 +13,12 @@ The archive is therefore three things at once:
 - a **gene pool** (evolution draws parents and cross-signature neighbors
   from it).
 
+For maintainability the archive is not only a database: ``SqliteArchive``
+can mirror every promoted champion to a directory of ordinary ``.py``
+files — readable, diffable, greppable — so the learned code sits in your
+repo like any other source, with its provenance in the header. History
+stays explicit and refactorable instead of being buried in a blob.
+
 Two backends ship: ``MemoryArchive`` (dict-backed, for tests and ephemeral
 runs) and ``SqliteArchive`` (stdlib sqlite3, the default for local work).
 """
@@ -54,6 +60,7 @@ class Variant:
     promoted: bool = False
     fitness: float | None = None  # measured (offline evolution); None = infer from metrics
     metrics: Metrics = field(default_factory=Metrics)
+    qualname: str = ""  # human name of the spec, for the mirror and headers
 
     def score(self, signals: list[Signal] | tuple[Signal, ...] = ()) -> float:
         """Measured fitness if present, else inferred from live evidence."""
@@ -228,6 +235,7 @@ CREATE TABLE IF NOT EXISTS variants (
     created_at          TEXT NOT NULL,
     promoted            INTEGER NOT NULL DEFAULT 0,
     fitness             REAL,
+    qualname            TEXT NOT NULL DEFAULT '',
     invocations         INTEGER NOT NULL DEFAULT 0,
     successes           INTEGER NOT NULL DEFAULT 0,
     exceptions          INTEGER NOT NULL DEFAULT 0,
@@ -256,7 +264,7 @@ CREATE INDEX IF NOT EXISTS idx_signals_key
 
 _VARIANT_COLS = (
     "signature_hash, surface_hash, version, operator, parents_json, body_json, "
-    "created_at, promoted, fitness, invocations, successes, exceptions, "
+    "created_at, promoted, fitness, qualname, invocations, successes, exceptions, "
     "validation_failures, avg_latency_ms"
 )
 
@@ -264,9 +272,10 @@ _VARIANT_COLS = (
 class SqliteArchive:
     """SQLite-backed Archive. Thread-safe via a single connection + lock."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, mirror_dir: str | Path | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.mirror_dir = Path(mirror_dir) if mirror_dir is not None else None
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.executescript(_SCHEMA)
@@ -283,6 +292,7 @@ class SqliteArchive:
             created_at,
             promoted,
             fitness,
+            qualname,
             inv,
             suc,
             exc,
@@ -299,6 +309,7 @@ class SqliteArchive:
             created_at=datetime.fromisoformat(created_at),
             promoted=bool(promoted),
             fitness=fitness,
+            qualname=qualname,
             metrics=Metrics(
                 invocations=inv,
                 successes=suc,
@@ -335,7 +346,7 @@ class SqliteArchive:
         with self._lock:
             self._conn.execute(
                 f"INSERT INTO variants ({_VARIANT_COLS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     variant.signature_hash,
                     variant.surface_hash,
@@ -346,6 +357,7 @@ class SqliteArchive:
                     variant.created_at.isoformat(),
                     int(variant.promoted),
                     variant.fitness,
+                    variant.qualname,
                     variant.metrics.invocations,
                     variant.metrics.successes,
                     variant.metrics.exceptions,
@@ -367,6 +379,7 @@ class SqliteArchive:
                 (signature_hash, surface_hash, version),
             )
             self._conn.commit()
+        self._mirror(signature_hash, surface_hash, version)
 
     def rollback(self, signature_hash: str, surface_hash: str) -> Variant | None:
         current = self.champion(signature_hash, surface_hash)
@@ -493,6 +506,49 @@ class SqliteArchive:
             )
             self._conn.commit()
 
+    def _mirror(self, signature_hash: str, surface_hash: str, version: int) -> None:
+        """Write the newly promoted champion as a readable .py file."""
+        if self.mirror_dir is None:
+            return
+        variant = self.get(signature_hash, surface_hash, version)
+        if variant is None:
+            return
+        self.mirror_dir.mkdir(parents=True, exist_ok=True)
+        name = _mirror_stem(variant)
+        (self.mirror_dir / f"{name}.py").write_text(render_champion(variant))
+
+
+def _mirror_stem(v: Variant) -> str:
+    base = "".join(c if c.isalnum() else "_" for c in (v.qualname or "fn")).strip("_")
+    return f"{base}_{v.signature_hash[:8]}"
+
+
+def render_champion(v: Variant) -> str:
+    """Render a variant as a standalone, readable Python file.
+
+    This is the maintainability contract: what the system learned is always
+    inspectable as ordinary source, never only as rows in a database. The
+    file is regenerated on every promotion; to take ownership of a body,
+    paste it into your own source under @syn, where it becomes the seed of
+    the next lineage.
+    """
+    name = (v.qualname.split(".")[-1] if v.qualname else "") or "solve"
+    lineage = f" <- v{', v'.join(map(str, v.parents))}" if v.parents else ""
+    header = (
+        f"# Champion for {v.qualname or v.signature_hash} "
+        f"(signature {v.signature_hash})\n"
+        f"# v{v.version} ({v.operator}{lineage}) — promoted {v.created_at.isoformat()}\n"
+        f"# reasoning: {v.body.reasoning}\n"
+        f"# Regenerated by synecdoche on every promotion; do not edit in place.\n"
+        f"# To take ownership, move the body into your source under @syn.\n"
+    )
+    if v.operator == "seed":
+        return header + "\n" + v.body.body
+    imports = "\n".join(v.body.imports)
+    body = v.body.body.replace("async def solve(", f"async def {name}(", 1)
+    parts = [p for p in (header.rstrip(), imports, body.rstrip()) if p]
+    return "\n\n".join(parts) + "\n"
+
 
 def open_archive(spec: str | Path | Archive | None) -> Archive:
     """Convenience constructor: path → SqliteArchive, None → MemoryArchive."""
@@ -501,7 +557,8 @@ def open_archive(spec: str | Path | Archive | None) -> Archive:
     if isinstance(spec, (str, Path)):
         p = Path(spec)
         if p.suffix == "":
-            p = p / "synecdoche.sqlite"
+            # A directory: SQLite for lineage, plus readable champion files.
+            return SqliteArchive(p / "synecdoche.sqlite", mirror_dir=p / "champions")
         return SqliteArchive(p)
     return spec  # already an Archive
 
@@ -514,4 +571,5 @@ __all__ = [
     "Variant",
     "now_utc",
     "open_archive",
+    "render_champion",
 ]
