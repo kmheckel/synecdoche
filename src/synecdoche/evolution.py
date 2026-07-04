@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from .archive import Variant
     from .compiler import GeneratedBody
     from .signature import CallSignature
     from .surface import ToolSurface
@@ -170,6 +171,15 @@ def default_fitness(
     return max(0.0, min(1.0, base))
 
 
+@dataclass
+class EvolutionReport:
+    """Outcome of one offline evolution run."""
+
+    champion: Variant
+    evaluated: list[tuple[Variant, float]]
+    generations: int
+
+
 def _is_jsonable(v: Any) -> bool:
     import json
 
@@ -182,6 +192,7 @@ def _is_jsonable(v: Any) -> bool:
 
 __all__ = [
     "Budget",
+    "EvolutionReport",
     "Operator",
     "Signal",
     "SignalKind",

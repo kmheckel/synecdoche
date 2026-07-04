@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from synecdoche import Runtime
+import synecdoche as syn
 from synecdoche.compiler import GeneratedBody
 from synecdoche.signature import CallSignature
 from synecdoche.surface import ToolSurface
@@ -13,49 +13,36 @@ class Summary(BaseModel):
     note: str
 
 
-def test_synth_end_to_end_with_stub_model(stub_model) -> None:
+def test_jit_compiles_at_first_call(stub_model) -> None:
     # Emit a GeneratedBody whose `body` returns a dict that validates as Summary.
     body_src = "async def solve(x: int) -> dict:\n    return {'value': x * 2, 'note': 'doubled'}\n"
     stub_model.push(
-        {
-            "reasoning": "Double x and tag it.",
-            "helpers": [],
-            "imports": [],
-            "body": body_src,
-        }
+        {"reasoning": "Double x and tag it.", "helpers": [], "imports": [], "body": body_src}
     )
-    rt = Runtime(model=stub_model.as_model())
+    be = syn.Backend(model=stub_model.as_model())
 
-    @rt.fn
+    @syn.jit(backend=be)
     def double(x: int) -> Summary:
         """Double x and tag it."""
 
-    assert double.mode == "synth"  # empty body -> synthesized
     result = double(21)
     assert isinstance(result, Summary)
     assert result.value == 42
     assert result.note == "doubled"
 
-    champ = double.champion
+    champ = syn.champion(double)
     assert champ is not None
     assert champ.operator == "spawn"
     assert champ.parents == ()
 
 
-def test_synth_cache_hit_skips_compile(stub_model) -> None:
-    # Only push once — if the runtime calls the compiler twice, the stub raises.
+def test_jit_cache_hit_skips_compile(stub_model) -> None:
+    # Only push once — if the backend calls the compiler twice, the stub raises.
     body_src = "async def solve(x: int) -> dict:\n    return {'value': x + 1, 'note': 'plus'}\n"
-    stub_model.push(
-        {
-            "reasoning": "Add one.",
-            "helpers": [],
-            "imports": [],
-            "body": body_src,
-        }
-    )
-    rt = Runtime(model=stub_model.as_model())
+    stub_model.push({"reasoning": "Add one.", "helpers": [], "imports": [], "body": body_src})
+    be = syn.Backend(model=stub_model.as_model())
 
-    @rt.fn
+    @syn.jit(backend=be)
     def inc(x: int) -> Summary:
         """Add one."""
 
@@ -65,16 +52,30 @@ def test_synth_cache_hit_skips_compile(stub_model) -> None:
     assert b.value == 3
 
 
-def test_recursion_alias_still_works(stub_model) -> None:
+def test_default_backend_via_configure(stub_model) -> None:
     body_src = "async def solve(x: int) -> dict:\n    return {'value': x, 'note': 'id'}\n"
     stub_model.push({"reasoning": "r", "helpers": [], "imports": [], "body": body_src})
-    rt = Runtime(model=stub_model.as_model())
+    syn.configure(model=stub_model.as_model())
+    try:
 
-    @rt.recursion
-    def ident(x: int) -> Summary:
+        @syn.jit
+        def ident(x: int) -> Summary:
+            """."""
+
+        assert ident(9).value == 9
+    finally:
+        syn.set_default_backend(None)
+
+
+def test_no_backend_is_a_clear_error() -> None:
+    @syn.jit
+    def orphan(x: int) -> int:
         """."""
 
-    assert ident(9).value == 9
+    import pytest
+
+    with pytest.raises(syn.FrameworkError, match="configure"):
+        orphan(1)
 
 
 def test_assemble_script_appends_await_solve() -> None:

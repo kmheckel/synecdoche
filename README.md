@@ -1,157 +1,167 @@
 # synecdoche
 
-**The part stands for the whole.** You write the part — a typed signature
-and a sentence of intent. The runtime supplies the whole: a body, compiled
-by a neural sequence model, sandboxed, archived, and evolved under
-selection pressure from types, exceptions, and feedback.
+**Composable transformations of typed Python functions, with a neural
+sequence model as the compiler.**
+
+The shape is deliberately that of an array framework, transplanted to
+general computing. JAX transforms numeric functions over arrays and
+differentiates them with calculus. synecdoche transforms typed functions
+over ordinary Python values and "differentiates" them with language:
+critiques in, revised programs out.
 
 ```python
+import synecdoche as syn
 from pathlib import Path
-from pydantic import BaseModel
 from pydantic_ai.models.anthropic import AnthropicModel
-from synecdoche import Runtime
 
-rt = Runtime(model=AnthropicModel("claude-sonnet-4-6"))
+syn.configure(model=AnthropicModel("claude-sonnet-4-6"))
 
-@rt.fn                      # solid — your body, and it self-heals
+@syn.jit
+def summarize(root: Path) -> Summary:
+    """Summarize the architecture of the codebase at root."""
+
+@syn.oracle
+def sentiment(text: str) -> Sentiment:
+    """Classify sentiment as positive, negative, or neutral."""
+
+labels = syn.vmap(sentiment)(texts)              # concurrent batching
+
+syn.feedback(summarize, 0.3, "missed the tests directory")
+syn.descend(summarize)                           # critique -> revised program
+
+report = syn.evolve(summarize, examples)         # the training loop
+print(syn.solidify(summarize))                   # the artifact is just Python
+```
+
+## The correspondence
+
+| array computing | synecdoche |
+|---|---|
+| `jax.jit` — trace to XLA, cache by shapes | `syn.jit` — compile intent (or source) to Python, cache by `(signature, tool surface)` |
+| primitives run on a device | bodies run in a sandbox; effects cross only through MCP tools |
+| `jax.vmap` — batch over the leading axis | `syn.vmap` — map over the leading argument, concurrently |
+| backprop accumulates gradients | `syn.feedback` accumulates critiques (exceptions record themselves) |
+| optimizer step updates parameters | `syn.descend` — recompile under the critiques; **the program is the parameter** |
+| training loop | `syn.evolve` — breed variants against examples, promote the fittest |
+| inspect the jaxpr / lowered HLO | `syn.lineage`, `syn.champion`, `syn.solidify` — except the artifact is ordinary Python you can commit |
+
+There is no `grad`, on purpose: programs, not tensors, are the parameters,
+so the derivative of a function with respect to a critique is another
+function. `feedback` plays backprop; `descend` plays the optimizer step.
+
+## `syn.jit` — compile whatever you give it
+
+`jit` accepts the full range between "I wrote the code" and "I wrote the
+intent":
+
+```python
+@syn.jit                      # handwritten body: runs natively, as written
 def parse_semver(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")
     return int(major), int(minor), int(patch)
 
-@rt.fn                      # synth — the body is grown at first call
-def summarize(root: Path) -> Summary:
-    """Summarize the architecture of the codebase at root."""
-
-@rt.fn(mode="oracle")       # oracle — the model *is* the body
-def sentiment(text: str) -> Sentiment:
-    """Classify sentiment as positive, negative, or neutral."""
+@syn.jit                      # empty body: compiled from signature + docstring
+def dedupe(records: list[Record]) -> list[Record]:
+    """Merge records that refer to the same real-world entity."""
 ```
 
-One decorator. Three phases of the same matter.
+Both are the same object afterwards. A handwritten body is kept as
+generation zero of a lineage; when it raises, the exception — with all its
+structured attributes — becomes the compile context for a descendant that
+fixes the defect, and the call succeeds instead of unwinding. A compiled
+body starts life sandboxed and earns its keep the same way. The call site
+cannot tell which is which, and `syn.solidify(f)` closes the loop: it
+renders the current body back into source, renamed and provenance-stamped,
+ready to commit — at which point it is deterministic code that can seed
+the next lineage.
 
-## Code is a phase of matter
+The cache key is `(signature, tool surface)`. Change the types, or mount
+different MCP tools, and you get a fresh compilation — retracing, in
+effect: the types are the shapes.
 
-Most frameworks draw a hard line between the code you write and the code a
-model writes. synecdoche's bet is that the line is a phase boundary, not a
-wall — and that a function should be able to cross it in both directions
-without the call site changing:
+## `syn.oracle` — the model as a black-box function
 
-| phase | what it is | how it runs |
-|---|---|---|
-| **solid** | a handwritten body | natively — it's your trusted code |
-| **synth** | a generated body | sandboxed, archived, evolvable |
-| **oracle** | no body at all | one typed inference per call |
+The other end of the spectrum: no code at all. The neural sequence model
+is invoked directly as an implementation of the signature, once per call,
+its output validated against the declared return type. Use it where the
+body would just be "judge this text" anyway.
 
-The contract — `def name(params) -> Return:` plus a docstring — is the
-fixed point. The implementation is fluid:
+```python
+@syn.oracle
+def detect_language(text: str) -> Language:
+    """Identify the natural language of the given text."""
+```
 
-- A handwritten body is registered as the **seed** (generation zero) of a
-  lineage. When it raises, the exception doesn't unwind to your caller —
-  it becomes a signal, and the seed *melts*: the runtime mutates it into a
-  sandboxed descendant that fixes the defect and serves the call.
-- A synthesized champion can be **frozen** the other way:
-  `fn.solidify("fn.py")` renders it back into committable source, with its
-  provenance in the header. Decorate it again and it's the seed of the
-  next lineage. Metamorphosis is the workflow, not a trick.
+## Failure is compile context
 
-## Everything is variation
+Every compilation is a **variation**: `spawn` (no parents), `mutate` (one
+parent plus the signals recorded against it), `cross` (two parents,
+during evolution). "Repair" is not a subsystem — it is `mutate` under a
+hard signal.
 
-There is exactly one way code comes into being here — a **variation
-operator** applied to parents under signals:
+Signals are the selection pressure, and they come in two strengths:
 
-| operator | parents | produced by |
-|---|---|---|
-| `spawn` | 0 | first call of a synth fn; exploration during `evolve()` |
-| `mutate` | 1 | healing (hard signal), `backward()` (soft signals), `evolve()` |
-| `cross` | 2 | `evolve()` recombining the top two variants |
-
-"Repair" is not a subsystem; it's `mutate` under an exception. Offline
-optimization is not a subsystem; it's the same operators run in a loop
-with measured fitness. The compiler has one entrypoint — `vary` — and the
-prompt simply renders whichever parents and signals the variation carries.
-
-Every variant lands in the **archive**: a cache (champion lookup skips
-compilation), a fossil record (lineage is never rewritten), and a gene
-pool (parents and cross-signature style neighbors are drawn from it).
-
-## Exceptions and feedback are gradients
-
-The landscape a body lives on is not differentiable, so synecdoche uses
-the two gradient surrogates code actually has:
-
-- **Hard gradients** — exceptions and validation failures, weight −1.
+- **Hard** — exceptions and validation failures, recorded automatically.
   Structured exceptions are the richest signal you can emit: a
-  `BudgetExceeded(kind="tool_calls", limit=200, measured=214)` teaches the
+  `BudgetExceeded(kind="tool_calls", limit=200, measured=214)` tells the
   compiler exactly what to fix. Raise rich exceptions; they are the API.
-- **Soft gradients** — graded feedback:
+- **Soft** — `syn.feedback(f, score, note)`, for the failures that don't
+  raise. The note is what the compiler reads; say what was wrong, not
+  just how wrong it was.
+
+Both flow through one `Signal` type into the same variation prompt.
+
+Every variant lands in the **archive** — a cache (champion lookup skips
+compilation), a fossil record (lineage is never rewritten), and a gene
+pool (`evolve` draws parents from it). Inspect it anytime:
 
 ```python
-result = summarize(Path("."))
-summarize.feedback(0.3, "missed the tests directory entirely")
-summarize.backward()        # textual gradient step: mutate under the
-                            # accumulated signals, shadow-validate, promote
+syn.champion(f)      # the variant currently serving calls
+syn.lineage(f)       # every variant ever compiled: operator, parents, metrics
+syn.signals(f)       # everything recorded against the champion
+syn.rollback(f)      # demote the champion to its parent
 ```
 
-Both kinds flow through the same `Signal` type into the same `mutate`
-operator. `backward()` is descent; the archive is the optimizer state.
+## `syn.evolve` — the training loop
 
-## Evolution, when you want it deliberate
-
-Online, selection is ambient — failures demote, descendants promote. When
-you have examples, run it as an explicit evolutionary loop:
+When you have examples, selection becomes deliberate:
 
 ```python
-report = summarize.evolve(
-    [{"root": Path("./demo-repo")}, {"root": Path("./other-repo")}],
+report = syn.evolve(
+    dedupe,
+    examples=[{"records": batch1}, {"records": batch2}],
     generations=3,
     population=4,
     score=lambda inputs, out: judge(out),   # optional; default = validated success
 )
-print(f"champion v{report.champion.version} fitness={report.champion.fitness:.2f}")
+print(f"v{report.champion.version} fitness={report.champion.fitness:.2f}")
 ```
 
 Each generation breeds `population` offspring — mutations of the fittest,
 crossovers of the top two, fresh spawns — scores every one against all
 examples, and promotes the overall champion.
 
-## Every function is reflective
-
-`@rt.fn` returns an `Fn`: callable exactly like the function you wrote,
-and also an object about itself.
-
-```python
-summarize.mode          # 'solid' | 'synth' | 'oracle'
-summarize.champion      # the Variant currently serving calls
-summarize.lineage()     # every variant ever bred, with operators and parents
-summarize.signals()     # everything recorded against the champion
-summarize.feedback(s, note)   # soft gradient
-summarize.backward()    # gradient step
-summarize.evolve(...)   # offline evolution
-summarize.solidify()    # freeze the champion into source
-summarize.rollback()    # demote the champion to its parent
-```
-
 ## The machinery
 
 ```
-contract ──> champion lookup ──> execute (native | sandbox) ──> validate ──> value
-                 │ miss                     │ raise
-                 ▼                          ▼
-               vary(spawn)              signal recorded
-                                        vary(mutate) ──> descendant promoted ──> retry
+call ──> champion lookup ──> execute (native | sandbox) ──> validate ──> value
+             │ miss                      │ raise
+             ▼                           ▼
+         vary(spawn)               signal recorded
+                                   vary(mutate) ──> descendant promoted ──> retry
 ```
 
 - [**pydantic-ai**](https://ai.pydantic.dev/) — provider-agnostic models
   and structured output. Swap Anthropic for OpenAI, Gemini, Ollama, or
   anything else it supports without touching synecdoche.
 - [**FastMCP**](https://gofastmcp.com/) — the tool surface. Mount MCP
-  servers on the runtime; generated bodies call them uniformly. The
-  surface is hashed, so a changed tool schema is a changed world: variants
-  bred against the old surface don't leak into the new one.
+  servers on the backend; compiled bodies call them uniformly. The surface
+  is hashed into the cache key, so a changed tool schema is a changed
+  world.
 - [**pydantic-monty**](https://pydantic.dev/articles/pydantic-monty) — a
   sandboxed Python interpreter that yields at external calls so the host
-  dispatches them. Generated code never touches your process, your
-  filesystem, or the network directly.
+  dispatches them. Compiled code never touches your process, filesystem,
+  or network directly.
 
 ## Installation
 
@@ -167,10 +177,13 @@ For providers:
 uv add "synecdoche[anthropic]"   # or [openai], [all]
 ```
 
-## Runtime configuration
+## Configuration
+
+`configure()` builds the default backend; every transform also accepts an
+explicit `backend=` for isolation (tests, multiple archives):
 
 ```python
-rt = Runtime(
+syn.configure(
     # Either a single model…
     model=AnthropicModel("claude-sonnet-4-6"),
     # …or split by role:
@@ -183,9 +196,9 @@ rt = Runtime(
     ],
 
     archive="./.archive",       # path -> SQLite; omit -> in-memory; or your own Archive
-    heal=True,                  # melt failing champions into descendants
-    max_repairs=2,              # mutation attempts per call
-    shadow_validate=True,       # backward() validates before promoting
+    heal=True,                  # recompile failing champions instead of raising
+    max_repairs=2,              # recompile attempts per call
+    shadow_validate=True,       # descend() validates before promoting
     max_recursion_depth=6,
     trace="stdout",             # or a callable, or a Tracer instance
 )
@@ -194,28 +207,31 @@ rt = Runtime(
 Per-function overrides:
 
 ```python
-@rt.fn(model=AnthropicModel("claude-opus-4-7"), max_repairs=4)
+@syn.jit(model=AnthropicModel("claude-opus-4-7"), max_repairs=4)
 def gnarly(root: Path) -> Report:
     """..."""
 ```
 
 ## Status
 
-A **proof of concept** exploring what a functional, type-first,
-evolutionary alternative to OOP agent frameworks looks like. Expect the
-API to keep evolving — it would be embarrassing if it didn't.
+A **proof of concept**. The bet: the array-framework recipe — pure typed
+functions plus a small set of composable transformations, with an
+optimizing compiler underneath — is the right shape for LLM-backed
+computing too, and the "agent framework" (classes, tool registries,
+conversation state) is the detour.
 
 Implemented:
 
-- [x] One decorator across solid / synth / oracle; seeds heal by melting.
-- [x] Unified variation (`spawn` / `mutate` / `cross`) with signals as the
-      only compile context; SQLite + in-memory population archives with
-      lineage, metrics, and signals.
-- [x] Soft gradients: `feedback()` / `backward()` with shadow validation.
-- [x] Offline evolution: `evolve()` with fitness measurement and champion
-      promotion; `solidify()` back to source.
+- [x] `jit` across handwritten and compiled bodies; seeds heal on
+      exception; single-flight compilation under concurrency.
+- [x] `oracle` and `vmap` (concurrent, bounded fan-out).
+- [x] One variation path (`spawn` / `mutate` / `cross`) with signals as
+      the only compile context; SQLite + in-memory archives with lineage,
+      metrics, and per-variant signals.
+- [x] `feedback` / `descend` with shadow validation; `evolve` with
+      measured fitness and champion promotion; `solidify` back to source.
 
-Deferred: inline-helper dispatch inside generated bodies, semantic
+Deferred: inline-helper dispatch inside compiled bodies, semantic
 neighbor search, full observability (Logfire), archive CLI, distributed
 archives, MCP-server export of compiled functions.
 
@@ -225,4 +241,5 @@ MIT — see [LICENSE](LICENSE).
 
 The `synecdoche` name has been on PyPI since 2023 (originally a JAX/Haiku
 hypernetwork experiment); this project reuses it with the original
-author's permission for a rewrite under the same MIT terms.
+author's permission for a rewrite under the same MIT terms. The name
+still fits: the part — a signature — stands for the whole.

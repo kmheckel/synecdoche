@@ -1,25 +1,15 @@
-"""The Runtime: models, tools, archive, sandbox — and the selection loop.
+"""The Backend: models, tools, archive, sandbox — the substrate transforms run on.
 
-The Runtime owns the machinery; ``Fn`` handles own the contracts. One
-decorator, ``@rt.fn``, covers the whole spectrum:
+Analogous to a device in an array framework: user code never talks to it
+directly. Transforms (``syn.jit``, ``syn.oracle``, ``syn.vmap``, ...) bind
+functions to a backend — explicitly via ``backend=``, or implicitly through
+the module default set by ``synecdoche.configure()``.
 
-    @rt.fn                      # handwritten body -> solid (seed of a lineage)
-    def total(xs: list[float]) -> float:
-        return sum(xs)
-
-    @rt.fn                      # empty body -> synth (spawned at first call)
-    def summarize(root: Path) -> Summary:
-        \"\"\"Summarize the architecture of the codebase at root.\"\"\"
-
-    @rt.fn(mode="oracle")       # no code at all -> one typed inference per call
-    def sentiment(text: str) -> Sentiment:
-        \"\"\"Classify sentiment.\"\"\"
-
-Every call resolves the same way: find the champion variant for
-``(signature, tool surface)``, execute it (natively if it is your seed,
-sandboxed if it was generated), validate the result against the declared
-return type, record the evidence. Failure is not an error path — it is the
-selection pressure that produces the next variant.
+Every jit call resolves the same way: find the champion variant for
+``(signature, tool surface)``, execute it (natively if it is your
+handwritten seed, sandboxed if it was compiled), validate the result
+against the declared return type, record the evidence. Failure is not an
+error path — it is the selection pressure that produces the next variant.
 """
 
 from __future__ import annotations
@@ -28,13 +18,13 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter
 
 from .archive import Archive, Variant, now_utc, open_archive
 from .compiler import Compiler, GeneratedBody, Inferencer
-from .evolution import Budget, Operator, Signal, TraceFrame, Variation
+from .evolution import Budget, EvolutionReport, Operator, Signal, TraceFrame, Variation
 from .exceptions import (
     BudgetExceeded,
     CompilationError,
@@ -42,7 +32,7 @@ from .exceptions import (
     RepairAttempt,
     ValidationError,
 )
-from .fn import EvolutionReport, Fn, Mode
+from .fn import Fn
 from .sandbox import MontySandbox, Sandbox
 from .signature import CallSignature
 from .surface import ToolSpec, ToolSurface, build_mcp_surface
@@ -52,11 +42,9 @@ if TYPE_CHECKING:
     from fastmcp import Client
     from pydantic_ai.models import Model
 
-F = TypeVar("F", bound=Callable[..., Any])
 
-
-class Runtime:
-    """The top-level object: owns all configuration and hosts the decorator."""
+class Backend:
+    """Owns all machinery: models, MCP surface, archive, sandbox, tracer."""
 
     def __init__(
         self,
@@ -105,66 +93,15 @@ class Runtime:
         self._surface: ToolSurface | None = None
         self._surface_lock = asyncio.Lock()
 
-        # Per-runtime compiler (caches system-prompt prefix inside pydantic-ai).
+        # Single-flight genesis: concurrent first calls (e.g. under vmap)
+        # must produce one lineage, not one per call.
+        self._genesis_locks: dict[str, asyncio.Lock] = {}
+
+        # Per-backend compiler (caches system-prompt prefix inside pydantic-ai).
         self._compiler = Compiler(self.model_code)
 
         # Oracle agents keyed by return-type, lazy init.
         self._oracle_cache: dict[Any, Inferencer] = {}
-
-    # ------------------------------------------------------------------
-    # The decorator
-    # ------------------------------------------------------------------
-
-    @overload
-    def fn(self, fn: F) -> F: ...
-    @overload
-    def fn(
-        self,
-        *,
-        mode: Mode | str = "auto",
-        model: Model | None = None,
-        max_repairs: int | None = None,
-    ) -> Callable[[F], F]: ...
-    def fn(
-        self,
-        fn: F | None = None,
-        *,
-        mode: Mode | str = "auto",
-        model: Model | None = None,
-        max_repairs: int | None = None,
-    ) -> F | Callable[[F], F]:
-        """Bind a typed contract to this runtime.
-
-        ``mode='auto'`` reads the function itself: a real body makes it
-        solid, an empty body makes it synth. Pass ``mode='oracle'`` for pure
-        inference, or force ``'solid'``/``'synth'`` explicitly.
-        """
-
-        def wrap(f: F) -> F:
-            return Fn(self, f, mode=mode, model=model, max_repairs=max_repairs)  # type: ignore[return-value]
-
-        if fn is not None:
-            return wrap(fn)
-        return wrap
-
-    # Aliases from the previous API, kept as sugar over fn().
-    def infer(self, fn: F | None = None, *, model: Model | None = None):
-        """Sugar for ``fn(mode='oracle')``."""
-        if fn is not None:
-            return self.fn(mode="oracle")(fn)
-        return self.fn(mode="oracle", model=model)
-
-    def recursion(
-        self,
-        fn: F | None = None,
-        *,
-        model: Model | None = None,
-        max_repair_attempts: int | None = None,
-    ):
-        """Sugar for ``fn(mode='synth')``."""
-        if fn is not None:
-            return self.fn(mode="synth")(fn)
-        return self.fn(mode="synth", model=model, max_repairs=max_repair_attempts)
 
     # ------------------------------------------------------------------
     # Oracle pipeline
@@ -172,7 +109,7 @@ class Runtime:
 
     async def _call_oracle(self, fn: Fn, inputs: dict[str, Any]) -> Any:
         sig = fn.signature
-        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"mode": "oracle"}))
+        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"kind": "oracle"}))
         model = fn._model or self.model_oracle
         key = (sig.return_type, id(model))
         oracle = self._oracle_cache.get(key)
@@ -187,17 +124,17 @@ class Runtime:
             )
         except Exception as e:
             self.tracer.emit(
-                TraceEvent("call_end", sig.qualname, {"mode": "oracle", "error": type(e).__name__})
+                TraceEvent("call_end", sig.qualname, {"kind": "oracle", "error": type(e).__name__})
             )
             raise
-        self.tracer.emit(TraceEvent("call_end", sig.qualname, {"mode": "oracle"}))
+        self.tracer.emit(TraceEvent("call_end", sig.qualname, {"kind": "oracle"}))
         return _validate_return(sig, value)
 
     # ------------------------------------------------------------------
-    # Code pipeline (solid + synth): champion -> execute -> select
+    # Jit pipeline: champion -> execute -> select
     # ------------------------------------------------------------------
 
-    async def _call_fn(self, fn: Fn, inputs: dict[str, Any], *, depth: int = 0) -> Any:
+    async def _call_jit(self, fn: Fn, inputs: dict[str, Any], *, depth: int = 0) -> Any:
         sig = fn.signature
         if depth > self.budget.max_recursion_depth:
             raise BudgetExceeded(
@@ -205,11 +142,15 @@ class Runtime:
             )
 
         surface = await self._ensure_surface()
-        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"mode": fn.mode, "depth": depth}))
+        self.tracer.emit(TraceEvent("call_start", sig.qualname, {"kind": "jit", "depth": depth}))
 
         champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
         if champion is None:
-            champion = await self._genesis(fn, surface, inputs)
+            lock = self._genesis_locks.setdefault(sig.signature_hash, asyncio.Lock())
+            async with lock:
+                champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
+                if champion is None:
+                    champion = await self._genesis(fn, surface, inputs)
         else:
             self.tracer.emit(TraceEvent("cache_hit", sig.qualname, {"version": champion.version}))
 
@@ -261,12 +202,7 @@ class Runtime:
                     TraceEvent(
                         "call_end",
                         sig.qualname,
-                        {
-                            "mode": fn.mode,
-                            "ok": False,
-                            "error": type(e).__name__,
-                            "attempt": attempt,
-                        },
+                        {"kind": "jit", "ok": False, "error": type(e).__name__, "attempt": attempt},
                     )
                 )
                 if not self.heal or attempt >= max_repairs:
@@ -275,7 +211,7 @@ class Runtime:
                         signature=sig,
                         attempts=attempts,
                     ) from e
-                champion = await self._descend(fn, surface, inputs, champion)
+                champion = await self._mutate_champion(fn, surface, inputs, champion)
                 continue
             else:
                 elapsed = (time.perf_counter() - t0) * 1000
@@ -286,9 +222,7 @@ class Runtime:
                     success=True,
                     latency_ms=elapsed,
                 )
-                self.tracer.emit(
-                    TraceEvent("call_end", sig.qualname, {"mode": fn.mode, "ok": True})
-                )
+                self.tracer.emit(TraceEvent("call_end", sig.qualname, {"kind": "jit", "ok": True}))
                 return value
 
         raise CompilationError(
@@ -305,16 +239,16 @@ class Runtime:
         return result
 
     # ------------------------------------------------------------------
-    # Variation: genesis, descent, gradient steps
+    # Variation: genesis, mutation, descent
     # ------------------------------------------------------------------
 
     async def _genesis(self, fn: Fn, surface: ToolSurface, inputs: dict[str, Any]) -> Variant:
-        """First variant of a lineage: register the seed, or spawn a body."""
-        if fn.mode == "solid":
+        """First variant of a lineage: register the seed, or compile a body."""
+        if fn._seed_source is not None:
             seed = GeneratedBody(
                 reasoning="Handwritten seed — generation zero of this lineage.",
                 imports=[],
-                body=fn._seed_source or "",
+                body=fn._seed_source,
             )
             return self._insert(fn.signature, surface, seed, operator="seed", parents=())
         variation = Variation(
@@ -327,7 +261,7 @@ class Runtime:
         body = await self._compiler_for(fn).vary(variation)
         return self._insert(fn.signature, surface, body, operator="spawn", parents=())
 
-    async def _descend(
+    async def _mutate_champion(
         self, fn: Fn, surface: ToolSurface, inputs: dict[str, Any], parent: Variant
     ) -> Variant:
         """Mutate a failing champion under everything recorded against it."""
@@ -348,8 +282,8 @@ class Runtime:
             fn.signature, surface, body, operator="mutate", parents=(parent.version,)
         )
 
-    async def _backward(self, fn: Fn) -> Variant:
-        """A textual gradient step: mutate under accumulated (soft) signals."""
+    async def _descend(self, fn: Fn) -> Variant:
+        """One optimizer step: mutate the champion under its accumulated signals."""
         surface = await self._ensure_surface()
         sig = fn.signature
         champion = self.archive.champion(sig.signature_hash, surface.surface_hash)
@@ -361,11 +295,11 @@ class Runtime:
         if not signals:
             raise FrameworkError(
                 f"{sig.qualname} has no signals against its champion — "
-                f"record feedback() before backward()."
+                f"record syn.feedback(...) before syn.descend(...)."
             )
         self.tracer.emit(
             TraceEvent(
-                "backward", sig.qualname, {"signals": len(signals), "version": champion.version}
+                "descend", sig.qualname, {"signals": len(signals), "version": champion.version}
             )
         )
         variation = Variation(
@@ -391,7 +325,7 @@ class Runtime:
                 _validate_return(sig, raw)
             except Exception as e:
                 raise CompilationError(
-                    f"Gradient step failed shadow validation: {e}", signature=sig
+                    f"Descent step failed shadow validation: {e}", signature=sig
                 ) from e
 
         return self._insert(sig, surface, body, operator="mutate", parents=(champion.version,))
@@ -655,7 +589,7 @@ class Runtime:
         return self._surface
 
     def _surface_hash_now(self) -> str:
-        """Surface hash for sync reflection paths (champion, lineage, feedback)."""
+        """Surface hash for sync introspection paths (champion, lineage, feedback)."""
         if self._surface is not None:
             return self._surface.surface_hash
         if not self._mcp_clients:
@@ -667,7 +601,7 @@ class Runtime:
             return asyncio.run(self._ensure_surface()).surface_hash
         raise FrameworkError(
             "Tool surface not built yet and we're inside an event loop — "
-            "call the function once (or await it) before reflecting on it."
+            "call the function once (or await it) before introspecting it."
         )
 
 
@@ -719,4 +653,4 @@ def _truncate(v: Any, n: int = 200) -> str:
     return s if len(s) <= n else s[:n] + "..."
 
 
-__all__ = ["Runtime"]
+__all__ = ["Backend"]

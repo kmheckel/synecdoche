@@ -11,7 +11,7 @@ The signature is invariant across all generations. You vary the body, never the 
 Return a `GeneratedBody` with:
 
 - `reasoning`: one paragraph explaining the approach — and, for mutate/cross, what you changed or recombined and why. Archived as this variant's provenance.
-- `helpers`: inline helpers to be resolved by the runtime — `kind=fn` (compiled into sandbox code by a recursive synthesis) or `kind=oracle` (resolved by a single typed LLM call). Omit when unneeded.
+- `helpers`: inline helpers to be resolved by the runtime — `kind=jit` (compiled into sandbox code by a recursive synthesis) or `kind=oracle` (resolved by a single typed LLM call). Omit when unneeded.
 - `imports`: Python imports, one per line, from the sandbox allow-list only.
 - `body`: the source of a single `async def solve(...)` function whose signature matches the target exactly, plus zero or more inline helper definitions.
 

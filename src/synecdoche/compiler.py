@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 class InlineHelper(BaseModel):
     """A helper function declared inline by a generated body."""
 
-    kind: Literal["fn", "oracle"]
+    kind: Literal["jit", "oracle"]
     name: str = Field(pattern=r"^[a-z_][a-z0-9_]*$")
     signature: str = Field(
         description="Python signature line with types, e.g. `(path: Path, head: str) -> FileKind`"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel
 
-from synecdoche import CompilationError, Runtime
+import synecdoche as syn
 
 
 class Out(BaseModel):
@@ -21,9 +21,9 @@ def test_healing_promotes_mutated_descendant(stub_model) -> None:
             {"reasoning": "healed", "helpers": [], "imports": [], "body": good_body},
         ]
     )
-    rt = Runtime(model=stub_model.as_model(), heal=True, max_repairs=2)
+    be = syn.Backend(model=stub_model.as_model(), heal=True, max_repairs=2)
 
-    @rt.fn
+    @syn.jit(backend=be)
     def go(x: int) -> Out:
         """."""
 
@@ -32,10 +32,10 @@ def test_healing_promotes_mutated_descendant(stub_model) -> None:
 
     # The lineage records the whole story: spawn -> mutate, with the
     # exception archived as a signal against the failed spawn.
-    lineage = go.lineage()
+    lineage = syn.lineage(go)
     assert [v.operator for v in lineage] == ["spawn", "mutate"]
     assert lineage[1].parents == (lineage[0].version,)
-    failed_signals = rt.archive.signals_for(
+    failed_signals = be.archive.signals_for(
         lineage[0].signature_hash, lineage[0].surface_hash, lineage[0].version
     )
     assert any(s.kind == "exception" and "boom" in s.content for s in failed_signals)
@@ -44,11 +44,11 @@ def test_healing_promotes_mutated_descendant(stub_model) -> None:
 def test_healing_disabled_raises_compilation_error(stub_model) -> None:
     bad_body = "async def solve(x: int) -> dict:\n    raise ValueError('boom')\n"
     stub_model.push({"reasoning": "first attempt", "helpers": [], "imports": [], "body": bad_body})
-    rt = Runtime(model=stub_model.as_model(), heal=False)
+    be = syn.Backend(model=stub_model.as_model(), heal=False)
 
-    @rt.fn
+    @syn.jit(backend=be)
     def go(x: int) -> Out:
         """."""
 
-    with pytest.raises(CompilationError):
+    with pytest.raises(syn.CompilationError):
         go(1)
