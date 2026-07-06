@@ -1,74 +1,58 @@
-"""synecdoche — JIT AI code synthesis as a functional paradigm.
+"""Synecdoche — HyperNetworks and compressed weight representations for Flax NNX.
 
-Write a typed Python function signature. Decorate it. At first call, an LLM
-compiles a body, which runs in a sandbox, is archived, and self-heals from
-exceptions. No Agent classes, no ambient state, no conversation history —
-just types and decorators.
+*Synecdoche* is the figure of speech in which a part stands in for the whole. Here
+a small set of learnable/evolvable parameters stands in for all the weights of a
+larger network: you train or evolve the part, and it generates the whole.
 
-Quickstart
-----------
+Quick start::
 
-    from pydantic_ai.models.anthropic import AnthropicModel
-    from synecdoche import Runtime
+    import synecdoche as syn
+    from flax import nnx
 
-    rt = Runtime(model=AnthropicModel("claude-sonnet-4-6"))
+    model = nnx.Linear(64, 64, rngs=nnx.Rngs(0))
+    target = nnx.state(model, nnx.Param)
 
-    @rt.infer
-    def classify_sentiment(text: str) -> Sentiment:
-        \"\"\"Classify sentiment as positive, negative, or neutral.\"\"\"
+    hyper = syn.LowRank(target, rank=8, rngs=nnx.Rngs(1))
+    syn.apply_to(model, hyper)                 # model runs on generated weights
+    print(syn.compression_ratio(hyper, model)) # << 1
 
-    print(classify_sentiment("I love this!"))
+Static generators live in :mod:`synecdoche.hyper`; input-conditioned ones in
+:mod:`synecdoche.experimental`. The optional :mod:`synecdoche.lazy` (needs the
+``[quax]`` extra) provides weights that never materialise in full.
 """
 
-from __future__ import annotations
-
-from .archive import Archive, ArchiveEntry, ArchiveMetrics, MemoryArchive, SqliteArchive
-from .compiler import GeneratedBody, InlineHelper
-from .exceptions import (
-    BudgetExceeded,
-    CompilationError,
-    ContextWindowExceeded,
-    FrameworkError,
-    RepairAttempt,
-    SandboxError,
-    ToolSurfaceDrift,
-    ValidationError,
+from . import experimental, hyper
+from .hyper import (
+    DCT,
+    Constant,
+    HyperNetwork,
+    LowRank,
+    MLPHyper,
+    RandomProjection,
 )
-from .runtime import Runtime
-from .sandbox import MontySandbox, Sandbox
-from .signature import CallSignature, Param
-from .surface import ToolSpec, ToolSurface
-from .trace import CallableTracer, NullTracer, StdoutTracer, TraceEvent, Tracer
+from .utils import (
+    apply_to,
+    compression_ratio,
+    functional,
+    materialize,
+    param_count,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
-    "Archive",
-    "ArchiveEntry",
-    "ArchiveMetrics",
-    "BudgetExceeded",
-    "CallSignature",
-    "CallableTracer",
-    "CompilationError",
-    "ContextWindowExceeded",
-    "FrameworkError",
-    "GeneratedBody",
-    "InlineHelper",
-    "MemoryArchive",
-    "MontySandbox",
-    "NullTracer",
-    "Param",
-    "RepairAttempt",
-    "Runtime",
-    "Sandbox",
-    "SandboxError",
-    "SqliteArchive",
-    "StdoutTracer",
-    "ToolSpec",
-    "ToolSurface",
-    "ToolSurfaceDrift",
-    "TraceEvent",
-    "Tracer",
-    "ValidationError",
+    "DCT",
+    "Constant",
+    "HyperNetwork",
+    "LowRank",
+    "MLPHyper",
+    "RandomProjection",
     "__version__",
+    "apply_to",
+    "compression_ratio",
+    "experimental",
+    "functional",
+    "hyper",
+    "materialize",
+    "param_count",
 ]
