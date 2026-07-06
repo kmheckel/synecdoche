@@ -1,7 +1,7 @@
 [project]
 name = "synecdoche"
-version = "0.1.0"
-description = "JIT AI code synthesis and execution — a functional paradigm for LLM-backed functions."
+version = "0.2.0"
+description = "HyperNetworks and compressed weight representations for JAX / Flax NNX."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
@@ -9,37 +9,34 @@ authors = [
     { name = "kmheckel" },
 ]
 keywords = [
-    "llm",
-    "ai",
-    "code-synthesis",
-    "sandbox",
-    "pydantic-ai",
-    "mcp",
-    "agents",
-    "jit",
+    "jax",
+    "flax",
+    "nnx",
+    "hypernetwork",
+    "hypernetworks",
+    "indirect-encoding",
+    "low-rank",
+    "compression",
+    "neuroevolution",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "pydantic>=2.9",
-    "pydantic-ai>=1.0",
-    "pydantic-monty>=0.0.16",
-    "fastmcp>=3.0",
-    "jinja2>=3.1",
+    "jax>=0.4.34",
+    "flax>=0.10.0",
 ]
 
 [project.optional-dependencies]
-anthropic = ["pydantic-ai[anthropic]>=1.0"]
-openai = ["pydantic-ai[openai]>=1.0"]
-all = ["pydantic-ai[anthropic,openai,google]>=1.0"]
+# Lazy, never-materialised weights via quax multiple dispatch (LoRA-style).
+quax = ["quax>=0.2.0"]
 
 [project.urls]
 Homepage = "https://github.com/kmheckel/synecdoche"
@@ -63,7 +60,6 @@ include = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.24",
     "ruff>=0.7",
 ]
 
@@ -85,13 +81,5 @@ ignore = [
     "E501", # line length (ruff format handles it)
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["B008"]
-"src/synecdoche/prompts/*" = ["E501"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
-markers = [
-    "live: tests that hit real model APIs (skipped by default unless ANTHROPIC_API_KEY is set)",
-]
